@@ -35,9 +35,6 @@ SSH_TIMEOUT_S = 8
 
 TEXTS = {
     "en": {
-        "subtitle": "SSH GPU monitoring, conda migration, and queue runner",
-        "settings": "Settings",
-        "servers": "Servers",
         "gpu_tab": "GPU Monitor",
         "conda_tab": "Conda Migration",
         "queue_tab": "Queue Runner",
@@ -54,6 +51,8 @@ TEXTS = {
         "refreshing_gpu": "Refreshing GPU status...",
         "connecting": "Connecting",
         "connection_failed": "Connection failed",
+        "reading_gpu": "Reading nvidia-smi...",
+        "nvidia_smi_failed": "Unable to read nvidia-smi. Check SSH, network, or server state.",
         "free_count": "Free",
         "last_refresh": "Last refresh",
         "idle_hint": "Green means idle. Red means busy or memory usage is above the threshold.",
@@ -104,13 +103,12 @@ TEXTS = {
         "queue_output": "Queue Runner Output",
         "ready": "Ready",
         "language": "Language",
+        "language_en": "English",
+        "language_zh": "Chinese",
         "save": "Save",
         "close": "Close",
     },
     "zh": {
-        "subtitle": "SSH GPU 监控、conda 环境迁移与任务排队",
-        "settings": "设置",
-        "servers": "服务器",
         "gpu_tab": "GPU 监控",
         "conda_tab": "Conda 环境迁移",
         "queue_tab": "任务队列",
@@ -127,6 +125,8 @@ TEXTS = {
         "refreshing_gpu": "正在刷新 GPU 状态...",
         "connecting": "正在连接",
         "connection_failed": "连接失败",
+        "reading_gpu": "正在读取 nvidia-smi...",
+        "nvidia_smi_failed": "无法读取 nvidia-smi，请检查 SSH、网络或服务器状态。",
         "free_count": "空闲",
         "last_refresh": "最后刷新",
         "idle_hint": "绿色表示空闲，红色表示正在使用或显存超过阈值。",
@@ -177,6 +177,8 @@ TEXTS = {
         "queue_output": "队列输出",
         "ready": "就绪",
         "language": "语言",
+        "language_en": "English",
+        "language_zh": "中文",
         "save": "保存",
         "close": "关闭",
     },
@@ -246,6 +248,14 @@ class GpuInfo:
         return min(100, round(self.mem_used_mb * 100 / self.mem_total_mb))
 
 
+@dataclass(frozen=True)
+class GpuStaticInfo:
+    index: str
+    uuid: str
+    name: str
+    mem_total_mb: int
+
+
 def load_servers() -> list[Server]:
     if not SERVERS_FILE.exists():
         example_file = APP_DIR / "servers.example.json"
@@ -283,6 +293,7 @@ def save_servers(servers: list[Server]) -> None:
             "hostname": server.hostname,
             "user": server.user,
             **({"port": server.port} if server.port != 22 else {}),
+            **({"ssh_host": server.ssh_host} if server.ssh_host else {}),
             **({"password": server.password} if server.password else {}),
         }
         for server in servers
@@ -508,13 +519,78 @@ def parse_gpu_csv(text: str) -> list[GpuInfo]:
     return gpus
 
 
-def query_gpus(server: Server, pool: PersistentSshPool | None = None) -> tuple[list[GpuInfo], str]:
-    command = "nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader,nounits"
-    proc = pool.run(server, command, timeout_s=20) if pool else run_remote_script(server, command, timeout_s=20)
+def parse_gpu_static_csv(text: str) -> dict[str, GpuStaticInfo]:
+    rows = csv.reader(line for line in text.splitlines() if line.strip())
+    items: dict[str, GpuStaticInfo] = {}
+    for row in rows:
+        if len(row) < 4:
+            continue
+        index, uuid, name, mem_total = [cell.strip() for cell in row[:4]]
+        items[index] = GpuStaticInfo(
+            index=index,
+            uuid=uuid,
+            name=name,
+            mem_total_mb=parse_int(mem_total),
+        )
+    return items
+
+
+def parse_gpu_dynamic_csv(text: str, static_info: dict[str, GpuStaticInfo]) -> list[GpuInfo]:
+    rows = csv.reader(line for line in text.splitlines() if line.strip())
+    gpus: list[GpuInfo] = []
+    for row in rows:
+        if len(row) < 4:
+            continue
+        index, mem_used, util, temp = [cell.strip() for cell in row[:4]]
+        cached = static_info.get(index)
+        if cached is None:
+            continue
+        temperature = None if temp in {"", "[Not Supported]", "N/A"} else parse_int(temp, 0)
+        gpus.append(
+            GpuInfo(
+                index=index,
+                uuid=cached.uuid,
+                name=cached.name,
+                mem_total_mb=cached.mem_total_mb,
+                mem_used_mb=parse_int(mem_used),
+                util_percent=parse_int(util),
+                temperature_c=temperature,
+            )
+        )
+    return gpus
+
+
+def query_gpus(
+    server: Server,
+    pool: PersistentSshPool | None = None,
+    static_info: dict[str, GpuStaticInfo] | None = None,
+) -> tuple[list[GpuInfo], dict[str, GpuStaticInfo], str]:
+    dynamic_command = "nvidia-smi --query-gpu=index,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader,nounits"
+    full_command = "nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader,nounits"
+
+    if static_info:
+        proc = pool.run(server, dynamic_command, timeout_s=20) if pool else run_remote_script(server, dynamic_command, timeout_s=20)
+        if proc.returncode == 0:
+            gpus = parse_gpu_dynamic_csv(proc.stdout, static_info)
+            if gpus and len(gpus) == len(static_info):
+                return gpus, static_info, ""
+
+    proc = pool.run(server, full_command, timeout_s=20) if pool else run_remote_script(server, full_command, timeout_s=20)
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout).strip()
-        return [], err or f"ssh 退出码 {proc.returncode}"
-    return parse_gpu_csv(proc.stdout), ""
+        return [], static_info or {}, err or f"ssh exit code {proc.returncode}"
+
+    gpus = parse_gpu_csv(proc.stdout)
+    refreshed_static = {
+        gpu.index: GpuStaticInfo(
+            index=gpu.index,
+            uuid=gpu.uuid,
+            name=gpu.name,
+            mem_total_mb=gpu.mem_total_mb,
+        )
+        for gpu in gpus
+    }
+    return gpus, refreshed_static, ""
 
 
 def shell_single_quote(value: str) -> str:
@@ -857,39 +933,13 @@ class ServerSettingsWindow(tk.Toplevel):
         self.destroy()
 
 
-class AppSettingsWindow(tk.Toplevel):
-    def __init__(self, app: "App") -> None:
-        super().__init__(app)
-        self.app = app
-        self.title(app.tr("settings"))
-        self.geometry("360x160")
-        self.resizable(False, False)
-        self.configure(bg=BG)
-        self.language_var = tk.StringVar(value="中文" if app.language == "zh" else "English")
-        self.transient(app)
-        self._build()
-
-    def _build(self) -> None:
-        body = tk.Frame(self, bg=BG, padx=16, pady=16)
-        body.pack(fill="both", expand=True)
-        tk.Label(body, text=self.app.tr("language"), bg=BG, fg=TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Combobox(body, values=["English", "中文"], textvariable=self.language_var, state="readonly").pack(fill="x", pady=(8, 16))
-        buttons = tk.Frame(body, bg=BG)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text=self.app.tr("close"), command=self.destroy).pack(side="right")
-        ttk.Button(buttons, text=self.app.tr("save"), command=self._save).pack(side="right", padx=(0, 8))
-
-    def _save(self) -> None:
-        self.app.set_language("zh" if self.language_var.get() == "中文" else "en")
-        self.destroy()
-
 
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("GPU Server Control")
         self.geometry("1260x820")
-        self.minsize(1080, 700)
+        self.minsize(980, 620)
         self.configure(bg=BG)
 
         self.app_settings = load_app_settings()
@@ -901,23 +951,24 @@ class App(tk.Tk):
         self.migration_running = False
 
         self.auto_refresh = tk.BooleanVar(value=True)
-        self.refresh_interval_s = tk.IntVar(value=15)
+        self.refresh_interval_s = tk.IntVar(value=5)
         self.util_threshold = tk.IntVar(value=5)
         self.mem_threshold_mb = tk.IntVar(value=1000)
-        self.last_refresh_at = tk.StringVar(value="尚未刷新")
+        self.last_refresh_at = tk.StringVar(value=self.tr("not_refreshed"))
         self.summary_free_var = tk.StringVar(value="-")
         self.summary_online_var = tk.StringVar(value="-")
         self.summary_busy_var = tk.StringVar(value="-")
-        self.summary_hint_var = tk.StringVar(value="正在准备连接服务器")
+        self.summary_hint_var = tk.StringVar(value=self.tr("preparing"))
         self.status_vars: dict[str, dict[str, tk.StringVar]] = {}
         self.gpu_frames: dict[str, tk.Frame] = {}
         self.count_labels: dict[str, tk.Label] = {}
         self.gpu_widgets: dict[str, dict[str, dict[str, object]]] = {}
+        self.gpu_static_cache: dict[str, dict[str, GpuStaticInfo]] = {}
         self.queue_running = False
         self.ssh_pool = PersistentSshPool()
         self.settings_window: tk.Toplevel | None = None
-        self.app_settings_window: tk.Toplevel | None = None
 
+        self._build_menu()
         self._configure_style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -936,6 +987,18 @@ class App(tk.Tk):
         save_app_settings(self.app_settings)
         self._rebuild_tabs()
 
+    def _set_language_from_menu(self, language: str) -> None:
+        self.set_language(language)
+
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self)
+        language_menu = tk.Menu(menu, tearoff=0)
+        language_menu.add_command(label=self.tr("language_en"), command=lambda: self._set_language_from_menu("en"))
+        language_menu.add_command(label=self.tr("language_zh"), command=lambda: self._set_language_from_menu("zh"))
+        menu.add_cascade(label=self.tr("language"), menu=language_menu)
+        self.config(menu=menu)
+        self.menu_bar = menu
+
     def _on_close(self) -> None:
         self.ssh_pool.close_all()
         self.destroy()
@@ -945,12 +1008,6 @@ class App(tk.Tk):
             self.settings_window.lift()
             return
         self.settings_window = ServerSettingsWindow(self, self.servers)
-
-    def open_app_settings(self) -> None:
-        if self.app_settings_window is not None and self.app_settings_window.winfo_exists():
-            self.app_settings_window.lift()
-            return
-        self.app_settings_window = AppSettingsWindow(self)
 
     def apply_server_settings(self, servers: list[Server]) -> None:
         save_servers(servers)
@@ -964,7 +1021,7 @@ class App(tk.Tk):
         self.summary_free_var.set("-")
         self.summary_online_var.set("-")
         self.summary_busy_var.set("-")
-        self.last_refresh_at.set("Not refreshed yet")
+        self.last_refresh_at.set(self.tr("not_refreshed"))
 
         self._rebuild_tabs()
         self.refresh_gpus()
@@ -982,6 +1039,7 @@ class App(tk.Tk):
         self.summary_busy_var.set("-")
         self.last_refresh_at.set(self.tr("not_refreshed"))
         self.summary_hint_var.set(self.tr("preparing"))
+        self._build_menu()
         self._build_ui()
         self.notebook.select(min(current, 2))
 
@@ -1007,16 +1065,9 @@ class App(tk.Tk):
     def _build_ui(self) -> None:
         self.main_frame = tk.Frame(self, bg=BG)
         self.main_frame.pack(fill="both", expand=True)
-        header = tk.Frame(self, bg=BG)
-        header.pack(fill="x", padx=18, pady=(16, 8))
-        header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="GPU Server Control", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text=self.tr("subtitle"), style="Muted.TLabel").grid(row=0, column=1, sticky="w", padx=(16, 12), pady=(9, 0))
-        ttk.Button(header, text=self.tr("servers"), command=self.open_server_settings).grid(row=0, column=2, sticky="e", pady=(4, 0), padx=(0, 8))
-        ttk.Button(header, text=self.tr("settings"), command=self.open_app_settings).grid(row=0, column=3, sticky="e", pady=(4, 0))
 
         notebook = ttk.Notebook(self.main_frame)
-        notebook.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        notebook.pack(fill="both", expand=True, padx=18, pady=(8, 18))
         self.notebook = notebook
         self.monitor_tab = tk.Frame(notebook, bg=BG)
         self.migrate_tab = tk.Frame(notebook, bg=BG)
@@ -1043,7 +1094,7 @@ class App(tk.Tk):
         controls.pack(side="right")
         ttk.Checkbutton(controls, text=self.tr("auto"), variable=self.auto_refresh).grid(row=0, column=0, padx=(0, 8))
         ttk.Label(controls, text=self.tr("every")).grid(row=0, column=1)
-        ttk.Spinbox(controls, from_=5, to=300, width=4, textvariable=self.refresh_interval_s).grid(row=0, column=2, padx=(4, 8))
+        ttk.Spinbox(controls, from_=1, to=300, width=4, textvariable=self.refresh_interval_s).grid(row=0, column=2, padx=(4, 8))
         ttk.Label(controls, text="s").grid(row=0, column=3, padx=(0, 10))
         ttk.Label(controls, text=self.tr("idle")).grid(row=0, column=4)
         ttk.Spinbox(controls, from_=0, to=100, width=4, textvariable=self.util_threshold).grid(row=0, column=5, padx=(4, 2))
@@ -1067,7 +1118,7 @@ class App(tk.Tk):
             self.scroll.inner.grid_columnconfigure(0, weight=1)
 
             host_var = tk.StringVar(value=server.label)
-            count_var = tk.StringVar(value="waiting")
+            count_var = tk.StringVar(value=self.tr("waiting"))
             status_var = tk.StringVar(value=f"SSH: {server.display_target}")
 
             left = tk.Frame(row, bg=SURFACE, width=150)
@@ -1285,7 +1336,7 @@ class App(tk.Tk):
         if self.auto_refresh.get() and not self.refresh_running:
             now = time.monotonic()
             last = getattr(self, "_last_refresh_monotonic", 0.0)
-            if now - last >= max(5, self.refresh_interval_s.get()):
+            if now - last >= max(1, self.refresh_interval_s.get()):
                 self.refresh_gpus()
         self.after(1000, self._auto_refresh_tick)
 
@@ -1296,15 +1347,13 @@ class App(tk.Tk):
         self._last_refresh_monotonic = time.monotonic()
         self.summary_hint_var.set(self.tr("refreshing_gpu"))
         for server in self.servers:
-            self.status_vars[server.alias]["count"].set(self.tr("connecting"))
-            self.status_vars[server.alias]["status"].set(f"{self.tr('connecting')} {server.display_target}")
             self._render_loading(server)
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _render_loading(self, server: Server) -> None:
         frame = self.gpu_frames[server.alias]
         if not frame.winfo_children():
-            tk.Label(frame, text="正在建立 SSH 连接并读取 nvidia-smi ...", bg=SURFACE, fg=MUTED).pack(anchor="w")
+            tk.Label(frame, text=self.tr("reading_gpu"), bg=SURFACE, fg=MUTED).pack(anchor="w")
 
     def _refresh_worker(self) -> None:
         results: list[tuple[Server, list[GpuInfo], str]] = []
@@ -1312,11 +1361,13 @@ class App(tk.Tk):
         lock = threading.Lock()
 
         def one(server: Server) -> None:
+            static_info = self.gpu_static_cache.get(server.alias, {})
             try:
-                gpus, error = query_gpus(server, self.ssh_pool)
+                gpus, refreshed_static, error = query_gpus(server, self.ssh_pool, static_info)
             except Exception as exc:
-                gpus, error = [], str(exc)
+                gpus, refreshed_static, error = [], static_info, str(exc)
             with lock:
+                self.gpu_static_cache[server.alias] = refreshed_static
                 results.append((server, gpus, error))
 
         for server in self.servers:
@@ -1361,10 +1412,11 @@ class App(tk.Tk):
             frame = self.gpu_frames[server.alias]
 
             if error:
-                vars_for_server["count"].set(self.tr("connection_failed"))
+                if server.alias not in self.gpu_widgets:
+                    vars_for_server["count"].set(self.tr("connection_failed"))
                 vars_for_server["status"].set(error)
                 self.count_labels[server.alias].configure(bg=RED_BG, fg=RED)
-                self._show_server_error(server.alias, frame, "无法读取 nvidia-smi，请检查 SSH 免密、网络或服务器状态。")
+                self._show_server_error(server.alias, frame, self.tr("nvidia_smi_failed"))
                 continue
 
             online += 1
@@ -1374,7 +1426,7 @@ class App(tk.Tk):
             count_bg = GREEN_BG if free_count else RED_BG
             count_fg = GREEN if free_count else RED
             vars_for_server["count"].set(f"{self.tr('free_count')} {free_count}/{len(gpus)}")
-            vars_for_server["status"].set(f"SSH: {server.display_target}")
+            vars_for_server["status"].set(server.display_target)
             self.count_labels[server.alias].configure(bg=count_bg, fg=count_fg)
             self._gpu_grid(server.alias, frame, gpus, util_threshold, mem_threshold)
 
