@@ -1,12 +1,15 @@
 __pycache__/
 *.py[cod]
 *.log
+.gpuq/
+.claude/
 
 build/
 dist/
 *.spec
 
 servers.json
+settings.json
 GPU_Server_Control_portable.zip
 
 .venv/

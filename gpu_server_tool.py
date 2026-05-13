@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import datetime as dt
 import json
 import queue
@@ -21,12 +22,159 @@ except ImportError:  # pragma: no cover - handled at runtime in the UI
 
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 SERVERS_FILE = APP_DIR / "servers.json"
+SETTINGS_FILE = APP_DIR / "settings.json"
 DEFAULT_IDENTITY_FILE = Path.home() / ".ssh" / "id_ed25519"
 DEFAULT_SHARED_DIR = "/mnt/share/user"
 DEFAULT_SOURCE_CONDA_ROOT = "/data/user/miniconda3"
 DEFAULT_TARGET_CONDA_ROOT = "/data/user/miniconda3"
+DEFAULT_QUEUE_RUNNER_DIR = "/mnt/share/user/gpu-queue-runner"
+LOCAL_GPUQ_FILE = RESOURCE_DIR / "queue_runner" / "gpuq"
 SSH_TIMEOUT_S = 8
+
+TEXTS = {
+    "en": {
+        "subtitle": "SSH GPU monitoring, conda migration, and queue runner",
+        "settings": "Settings",
+        "servers": "Servers",
+        "gpu_tab": "GPU Monitor",
+        "conda_tab": "Conda Migration",
+        "queue_tab": "Queue Runner",
+        "free": "Free",
+        "online": "Online",
+        "busy": "Busy",
+        "auto": "Auto",
+        "every": "Every",
+        "idle": "Idle",
+        "refresh": "Refresh",
+        "manage_servers": "Manage Servers",
+        "not_refreshed": "Not refreshed yet",
+        "preparing": "Preparing to connect to servers",
+        "refreshing_gpu": "Refreshing GPU status...",
+        "connecting": "Connecting",
+        "connection_failed": "Connection failed",
+        "free_count": "Free",
+        "last_refresh": "Last refresh",
+        "idle_hint": "Green means idle. Red means busy or memory usage is above the threshold.",
+        "source_env": "Source Environment",
+        "source_env_hint": "Pack an existing environment to a shared directory",
+        "target_env": "Target Environment",
+        "target_env_hint": "Unpack into target miniconda envs directory",
+        "server": "Server",
+        "conda_root": "miniconda root",
+        "env_name": "Environment name",
+        "target_env_name": "Target env name",
+        "shared_dir": "Source shared",
+        "target_shared": "Target shared",
+        "target_shared_hint": "Blank = same as source",
+        "overwrite": "Overwrite target env if it exists",
+        "start_migration": "Start Migration",
+        "preview": "Preview",
+        "current_state": "Current State",
+        "migration_log": "Migration Log",
+        "clear": "Clear",
+        "waiting": "Waiting",
+        "queue_server": "Server",
+        "queue_dir": "Remote gpuq dir",
+        "install_sync": "Install/Sync",
+        "add_job": "Add Job",
+        "name": "Name",
+        "cwd": "CWD",
+        "command": "Command",
+        "gpus": "GPUs",
+        "queue": "Queue",
+        "priority": "Priority",
+        "conda_env": "Conda env",
+        "add_to_queue": "Add to Queue",
+        "operations": "Operations",
+        "daemon_status": "Daemon Status",
+        "start_daemon": "Start Daemon",
+        "stop_daemon": "Stop Daemon",
+        "queue_list": "Queue List",
+        "daemon_logs": "Daemon Logs",
+        "job_id": "Job ID",
+        "show": "Show",
+        "logs": "Logs",
+        "retry": "Retry",
+        "cancel": "Cancel",
+        "queue_output": "Queue Runner Output",
+        "ready": "Ready",
+        "language": "Language",
+        "save": "Save",
+        "close": "Close",
+    },
+    "zh": {
+        "subtitle": "SSH GPU 监控、conda 环境迁移与任务排队",
+        "settings": "设置",
+        "servers": "服务器",
+        "gpu_tab": "GPU 监控",
+        "conda_tab": "Conda 环境迁移",
+        "queue_tab": "任务队列",
+        "free": "空闲",
+        "online": "在线",
+        "busy": "占用",
+        "auto": "自动",
+        "every": "每",
+        "idle": "空闲阈值",
+        "refresh": "刷新",
+        "manage_servers": "管理服务器",
+        "not_refreshed": "尚未刷新",
+        "preparing": "正在准备连接服务器",
+        "refreshing_gpu": "正在刷新 GPU 状态...",
+        "connecting": "正在连接",
+        "connection_failed": "连接失败",
+        "free_count": "空闲",
+        "last_refresh": "最后刷新",
+        "idle_hint": "绿色表示空闲，红色表示正在使用或显存超过阈值。",
+        "source_env": "源环境",
+        "source_env_hint": "将已有环境打包到共享目录",
+        "target_env": "目标环境",
+        "target_env_hint": "解压到目标 miniconda 的 envs 目录",
+        "server": "服务器",
+        "conda_root": "miniconda 根目录",
+        "env_name": "环境名",
+        "target_env_name": "目标环境名",
+        "shared_dir": "源共享目录",
+        "target_shared": "目标共享目录",
+        "target_shared_hint": "留空表示与源一致",
+        "overwrite": "目标环境已存在时覆盖",
+        "start_migration": "开始迁移",
+        "preview": "流程预览",
+        "current_state": "当前状态",
+        "migration_log": "迁移日志",
+        "clear": "清空",
+        "waiting": "等待中",
+        "queue_server": "服务器",
+        "queue_dir": "远端 gpuq 目录",
+        "install_sync": "安装/同步",
+        "add_job": "添加任务",
+        "name": "名称",
+        "cwd": "运行目录",
+        "command": "命令",
+        "gpus": "GPU",
+        "queue": "队列",
+        "priority": "优先级",
+        "conda_env": "Conda 环境",
+        "add_to_queue": "加入队列",
+        "operations": "操作",
+        "daemon_status": "守护状态",
+        "start_daemon": "启动守护",
+        "stop_daemon": "停止守护",
+        "queue_list": "队列列表",
+        "daemon_logs": "守护日志",
+        "job_id": "任务 ID",
+        "show": "查看",
+        "logs": "日志",
+        "retry": "重试",
+        "cancel": "取消",
+        "queue_output": "队列输出",
+        "ready": "就绪",
+        "language": "语言",
+        "save": "保存",
+        "close": "关闭",
+    },
+}
 
 BG = "#f5f7fb"
 SURFACE = "#ffffff"
@@ -136,6 +284,21 @@ def save_servers(servers: list[Server]) -> None:
     tmp = SERVERS_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(SERVERS_FILE)
+
+
+def load_app_settings() -> dict[str, str]:
+    if not SETTINGS_FILE.exists():
+        return {"language": "en"}
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"language": "en"}
+    language = str(data.get("language", "en"))
+    return {"language": language if language in TEXTS else "en"}
+
+
+def save_app_settings(settings: dict[str, str]) -> None:
+    SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def ssh_binary() -> str:
@@ -462,6 +625,33 @@ echo "__DEST__=$DEST"
 """
 
 
+def gpuq_install_script(remote_dir: str, payload_b64: str) -> str:
+    return f"""set -euo pipefail
+REMOTE_DIR={shell_single_quote(remote_dir)}
+PAYLOAD={shell_single_quote(payload_b64)}
+mkdir -p "$REMOTE_DIR"
+printf '%s' "$PAYLOAD" | base64 -d > "$REMOTE_DIR/gpuq"
+chmod +x "$REMOTE_DIR/gpuq"
+cd "$REMOTE_DIR"
+./gpuq init
+./gpuq doctor
+echo "__GPUQ_DIR__=$REMOTE_DIR"
+"""
+
+
+def gpuq_command_script(remote_dir: str, args: list[str]) -> str:
+    quoted_args = " ".join(shell_single_quote(arg) for arg in args)
+    return f"""set -euo pipefail
+REMOTE_DIR={shell_single_quote(remote_dir)}
+if [ ! -x "$REMOTE_DIR/gpuq" ]; then
+  echo "gpuq is not installed or executable at: $REMOTE_DIR/gpuq" >&2
+  exit 80
+fi
+cd "$REMOTE_DIR"
+./gpuq {quoted_args}
+"""
+
+
 class ScrollFrame(tk.Frame):
     def __init__(self, parent: tk.Widget) -> None:
         super().__init__(parent, bg=BG)
@@ -661,6 +851,33 @@ class ServerSettingsWindow(tk.Toplevel):
         self.destroy()
 
 
+class AppSettingsWindow(tk.Toplevel):
+    def __init__(self, app: "App") -> None:
+        super().__init__(app)
+        self.app = app
+        self.title(app.tr("settings"))
+        self.geometry("360x160")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self.language_var = tk.StringVar(value="中文" if app.language == "zh" else "English")
+        self.transient(app)
+        self._build()
+
+    def _build(self) -> None:
+        body = tk.Frame(self, bg=BG, padx=16, pady=16)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text=self.app.tr("language"), bg=BG, fg=TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Combobox(body, values=["English", "中文"], textvariable=self.language_var, state="readonly").pack(fill="x", pady=(8, 16))
+        buttons = tk.Frame(body, bg=BG)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text=self.app.tr("close"), command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text=self.app.tr("save"), command=self._save).pack(side="right", padx=(0, 8))
+
+    def _save(self) -> None:
+        self.app.set_language("zh" if self.language_var.get() == "中文" else "en")
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -669,6 +886,8 @@ class App(tk.Tk):
         self.minsize(1080, 700)
         self.configure(bg=BG)
 
+        self.app_settings = load_app_settings()
+        self.language = self.app_settings.get("language", "en")
         self.servers = load_servers()
         self.server_by_label = {server.label: server for server in self.servers}
         self.result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -688,8 +907,10 @@ class App(tk.Tk):
         self.gpu_frames: dict[str, tk.Frame] = {}
         self.count_labels: dict[str, tk.Label] = {}
         self.gpu_widgets: dict[str, dict[str, dict[str, object]]] = {}
+        self.queue_running = False
         self.ssh_pool = PersistentSshPool()
         self.settings_window: tk.Toplevel | None = None
+        self.app_settings_window: tk.Toplevel | None = None
 
         self._configure_style()
         self._build_ui()
@@ -697,6 +918,17 @@ class App(tk.Tk):
         self.after(200, self._poll_queue)
         self.after(500, self.refresh_gpus)
         self.after(1000, self._auto_refresh_tick)
+
+    def tr(self, key: str) -> str:
+        return TEXTS.get(self.language, TEXTS["en"]).get(key, TEXTS["en"].get(key, key))
+
+    def set_language(self, language: str) -> None:
+        if language not in TEXTS:
+            language = "en"
+        self.language = language
+        self.app_settings["language"] = language
+        save_app_settings(self.app_settings)
+        self._rebuild_tabs()
 
     def _on_close(self) -> None:
         self.ssh_pool.close_all()
@@ -707,6 +939,12 @@ class App(tk.Tk):
             self.settings_window.lift()
             return
         self.settings_window = ServerSettingsWindow(self, self.servers)
+
+    def open_app_settings(self) -> None:
+        if self.app_settings_window is not None and self.app_settings_window.winfo_exists():
+            self.app_settings_window.lift()
+            return
+        self.app_settings_window = AppSettingsWindow(self)
 
     def apply_server_settings(self, servers: list[Server]) -> None:
         save_servers(servers)
@@ -722,18 +960,24 @@ class App(tk.Tk):
         self.summary_busy_var.set("-")
         self.last_refresh_at.set("Not refreshed yet")
 
-        current = self.notebook.index(self.notebook.select())
-        for tab in (self.monitor_tab, self.migrate_tab):
-            self.notebook.forget(tab)
-        self.monitor_tab = tk.Frame(self.notebook, bg=BG)
-        self.migrate_tab = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.monitor_tab, text="GPU Monitor")
-        self.notebook.add(self.migrate_tab, text="Conda Migration")
-        self._build_monitor_tab()
-        self._build_migrate_tab()
-        self._bind_preview_updates()
-        self.notebook.select(min(current, 1))
+        self._rebuild_tabs()
         self.refresh_gpus()
+
+    def _rebuild_tabs(self) -> None:
+        current = self.notebook.index(self.notebook.select()) if hasattr(self, "notebook") else 0
+        if hasattr(self, "main_frame"):
+            self.main_frame.destroy()
+        self.status_vars.clear()
+        self.gpu_frames.clear()
+        self.count_labels.clear()
+        self.gpu_widgets.clear()
+        self.summary_free_var.set("-")
+        self.summary_online_var.set("-")
+        self.summary_busy_var.set("-")
+        self.last_refresh_at.set(self.tr("not_refreshed"))
+        self.summary_hint_var.set(self.tr("preparing"))
+        self._build_ui()
+        self.notebook.select(min(current, 2))
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -760,18 +1004,22 @@ class App(tk.Tk):
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x", padx=18, pady=(16, 8))
         ttk.Label(header, text="GPU Server Control", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="SSH 实时监控与 conda 环境迁移", style="Muted.TLabel").pack(side="left", padx=(16, 0), pady=(9, 0))
-        ttk.Button(header, text="Servers", command=self.open_server_settings).pack(side="right", pady=(4, 0))
+        ttk.Label(header, text=self.tr("subtitle"), style="Muted.TLabel").pack(side="left", padx=(16, 0), pady=(9, 0))
+        ttk.Button(header, text=self.tr("settings"), command=self.open_app_settings).pack(side="right", pady=(4, 0), padx=(8, 0))
+        ttk.Button(header, text=self.tr("servers"), command=self.open_server_settings).pack(side="right", pady=(4, 0))
 
         notebook = ttk.Notebook(self.main_frame)
         notebook.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         self.notebook = notebook
         self.monitor_tab = tk.Frame(notebook, bg=BG)
         self.migrate_tab = tk.Frame(notebook, bg=BG)
-        notebook.add(self.monitor_tab, text="GPU 监控")
-        notebook.add(self.migrate_tab, text="Conda 环境迁移")
+        self.queue_tab = tk.Frame(notebook, bg=BG)
+        notebook.add(self.monitor_tab, text=self.tr("gpu_tab"))
+        notebook.add(self.migrate_tab, text=self.tr("conda_tab"))
+        notebook.add(self.queue_tab, text=self.tr("queue_tab"))
         self._build_monitor_tab()
         self._build_migrate_tab()
+        self._build_queue_tab()
         self._bind_preview_updates()
 
     def _build_monitor_tab(self) -> None:
@@ -780,23 +1028,23 @@ class App(tk.Tk):
 
         stats = tk.Frame(top, bg=BG)
         stats.pack(side="left", fill="x", expand=True)
-        self._summary_tile(stats, "Free", self.summary_free_var, GREEN_BG, GREEN).pack(side="left", padx=(0, 6))
-        self._summary_tile(stats, "Online", self.summary_online_var, BLUE_BG, BLUE).pack(side="left", padx=6)
-        self._summary_tile(stats, "Busy", self.summary_busy_var, AMBER_BG, AMBER).pack(side="left", padx=6)
+        self._summary_tile(stats, self.tr("free"), self.summary_free_var, GREEN_BG, GREEN).pack(side="left", padx=(0, 6))
+        self._summary_tile(stats, self.tr("online"), self.summary_online_var, BLUE_BG, BLUE).pack(side="left", padx=6)
+        self._summary_tile(stats, self.tr("busy"), self.summary_busy_var, AMBER_BG, AMBER).pack(side="left", padx=6)
 
         controls = tk.Frame(top, bg=SURFACE, bd=1, relief="solid", padx=8, pady=6)
         controls.pack(side="right")
-        ttk.Checkbutton(controls, text="Auto", variable=self.auto_refresh).grid(row=0, column=0, padx=(0, 8))
-        ttk.Label(controls, text="Every").grid(row=0, column=1)
+        ttk.Checkbutton(controls, text=self.tr("auto"), variable=self.auto_refresh).grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(controls, text=self.tr("every")).grid(row=0, column=1)
         ttk.Spinbox(controls, from_=5, to=300, width=4, textvariable=self.refresh_interval_s).grid(row=0, column=2, padx=(4, 8))
         ttk.Label(controls, text="s").grid(row=0, column=3, padx=(0, 10))
-        ttk.Label(controls, text="Idle").grid(row=0, column=4)
+        ttk.Label(controls, text=self.tr("idle")).grid(row=0, column=4)
         ttk.Spinbox(controls, from_=0, to=100, width=4, textvariable=self.util_threshold).grid(row=0, column=5, padx=(4, 2))
         ttk.Label(controls, text="% /").grid(row=0, column=6)
         ttk.Spinbox(controls, from_=0, to=80000, increment=100, width=6, textvariable=self.mem_threshold_mb).grid(row=0, column=7, padx=(4, 2))
         ttk.Label(controls, text="MB").grid(row=0, column=8, padx=(0, 10))
-        ttk.Button(controls, text="Refresh", command=self.refresh_gpus).grid(row=0, column=9)
-        ttk.Button(controls, text="Manage Servers", command=self.open_server_settings).grid(row=0, column=10, padx=(8, 0))
+        ttk.Button(controls, text=self.tr("refresh"), command=self.refresh_gpus).grid(row=0, column=9)
+        ttk.Button(controls, text=self.tr("manage_servers"), command=self.open_server_settings).grid(row=0, column=10, padx=(8, 0))
 
         hint_row = tk.Frame(self.monitor_tab, bg=BG)
         hint_row.pack(fill="x", pady=(0, 4))
@@ -858,31 +1106,31 @@ class App(tk.Tk):
         self.target_shared_dir_var = tk.StringVar()
         self.overwrite_var = tk.BooleanVar(value=False)
         self.preview_var = tk.StringVar(value="")
-        self.migration_step_var = tk.StringVar(value="等待开始")
+        self.migration_step_var = tk.StringVar(value=self.tr("waiting"))
 
-        source_card = self._form_card(body, "源环境", "选择已有环境并打包到共享目录")
+        source_card = self._form_card(body, self.tr("source_env"), self.tr("source_env_hint"))
         source_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
-        target_card = self._form_card(body, "目标环境", "解压到目标 miniconda 的 envs 目录")
+        target_card = self._form_card(body, self.tr("target_env"), self.tr("target_env_hint"))
         target_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 12))
 
-        self._field(source_card, 1, "服务器", ttk.Combobox(source_card, values=labels, textvariable=self.source_server_var, state="readonly"))
-        self._field(source_card, 2, "miniconda 根目录", ttk.Entry(source_card, textvariable=self.source_conda_root_var))
-        self._field(source_card, 3, "环境名", ttk.Entry(source_card, textvariable=self.env_name_var))
+        self._field(source_card, 1, self.tr("server"), ttk.Combobox(source_card, values=labels, textvariable=self.source_server_var, state="readonly"))
+        self._field(source_card, 2, self.tr("conda_root"), ttk.Entry(source_card, textvariable=self.source_conda_root_var))
+        self._field(source_card, 3, self.tr("env_name"), ttk.Entry(source_card, textvariable=self.env_name_var))
 
-        self._field(target_card, 1, "服务器", ttk.Combobox(target_card, values=labels, textvariable=self.target_server_var, state="readonly"))
-        self._field(target_card, 2, "miniconda 根目录", ttk.Entry(target_card, textvariable=self.target_conda_root_var))
-        self._field(target_card, 3, "目标环境名", ttk.Entry(target_card, textvariable=self.target_env_name_var))
+        self._field(target_card, 1, self.tr("server"), ttk.Combobox(target_card, values=labels, textvariable=self.target_server_var, state="readonly"))
+        self._field(target_card, 2, self.tr("conda_root"), ttk.Entry(target_card, textvariable=self.target_conda_root_var))
+        self._field(target_card, 3, self.tr("target_env_name"), ttk.Entry(target_card, textvariable=self.target_env_name_var))
 
         options = tk.Frame(body, bg=SURFACE, bd=1, relief="solid", padx=14, pady=12)
         options.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         options.grid_columnconfigure(1, weight=1)
-        tk.Label(options, text="共享目录", bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        tk.Label(options, text=self.tr("shared_dir"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 10))
         ttk.Entry(options, textvariable=self.shared_dir_var).grid(row=0, column=1, sticky="ew")
-        tk.Label(options, text="Target shared", bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 10, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
+        tk.Label(options, text=self.tr("target_shared"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 10, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
         ttk.Entry(options, textvariable=self.target_shared_dir_var).grid(row=1, column=1, sticky="ew", pady=(10, 0))
-        tk.Label(options, text="Blank = same as source", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).grid(row=1, column=2, sticky="w", padx=16, pady=(10, 0))
-        ttk.Checkbutton(options, text="目标环境已存在时覆盖", variable=self.overwrite_var).grid(row=0, column=2, padx=16)
-        self.migrate_button = ttk.Button(options, text="开始迁移", command=self.start_migration, style="Accent.TButton")
+        tk.Label(options, text=self.tr("target_shared_hint"), bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).grid(row=1, column=2, sticky="w", padx=16, pady=(10, 0))
+        ttk.Checkbutton(options, text=self.tr("overwrite"), variable=self.overwrite_var).grid(row=0, column=2, padx=16)
+        self.migrate_button = ttk.Button(options, text=self.tr("start_migration"), command=self.start_migration, style="Accent.TButton")
         self.migrate_button.grid(row=0, column=3)
 
         lower = tk.Frame(body, bg=BG)
@@ -893,12 +1141,12 @@ class App(tk.Tk):
 
         preview = tk.Frame(lower, bg=SURFACE, bd=1, relief="solid", padx=14, pady=12)
         preview.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 12))
-        tk.Label(preview, text="流程预览", bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        tk.Label(preview, text=self.tr("preview"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
         tk.Label(preview, textvariable=self.preview_var, bg=SURFACE, fg=MUTED, justify="left", anchor="w").pack(fill="x", pady=(8, 0))
 
         progress = tk.Frame(lower, bg=SURFACE, bd=1, relief="solid", padx=14, pady=12)
         progress.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 12))
-        tk.Label(progress, text="当前状态", bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        tk.Label(progress, text=self.tr("current_state"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
         tk.Label(progress, textvariable=self.migration_step_var, bg=SURFACE, fg=BLUE, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(8, 8))
         self.migration_progress = ttk.Progressbar(progress, mode="indeterminate")
         self.migration_progress.pack(fill="x")
@@ -907,8 +1155,8 @@ class App(tk.Tk):
         log_panel.grid(row=1, column=0, columnspan=2, sticky="nsew")
         log_panel.grid_rowconfigure(1, weight=1)
         log_panel.grid_columnconfigure(0, weight=1)
-        tk.Label(log_panel, text="迁移日志", bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Button(log_panel, text="清空日志", command=lambda: self.migration_log.delete("1.0", "end")).grid(row=0, column=1, sticky="e")
+        tk.Label(log_panel, text=self.tr("migration_log"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(log_panel, text=self.tr("clear"), command=lambda: self.migration_log.delete("1.0", "end")).grid(row=0, column=1, sticky="e")
         self.migration_log = tk.Text(log_panel, height=16, wrap="word", font=("Consolas", 10), bg=DARK, fg="#d7e2ee", insertbackground="#d7e2ee", relief="flat")
         self.migration_log.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
         self._update_preview()
@@ -923,6 +1171,81 @@ class App(tk.Tk):
     def _field(self, parent: tk.Frame, row: int, label: str, widget: tk.Widget) -> None:
         tk.Label(parent, text=label, bg=SURFACE, fg=MUTED).grid(row=row, column=0, sticky="w", pady=(12, 0), padx=(0, 10))
         widget.grid(row=row, column=1, sticky="ew", pady=(12, 0))
+
+    def _build_queue_tab(self) -> None:
+        body = tk.Frame(self.queue_tab, bg=BG)
+        body.pack(fill="both", expand=True, pady=(12, 0))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(2, weight=1)
+
+        labels = [server.label for server in self.servers]
+        self.queue_server_var = tk.StringVar(value=labels[0] if labels else "")
+        self.queue_dir_var = tk.StringVar(value=DEFAULT_QUEUE_RUNNER_DIR)
+        self.queue_name_var = tk.StringVar()
+        self.queue_cwd_var = tk.StringVar()
+        self.queue_command_var = tk.StringVar()
+        self.queue_gpus_var = tk.StringVar(value="all")
+        self.queue_group_var = tk.StringVar(value="default")
+        self.queue_priority_var = tk.StringVar(value="0")
+        self.queue_conda_env_var = tk.StringVar()
+        self.queue_job_id_var = tk.StringVar()
+        self.queue_status_var = tk.StringVar(value=self.tr("ready"))
+
+        top = tk.Frame(body, bg=SURFACE, bd=1, relief="solid", padx=12, pady=10)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        top.grid_columnconfigure(1, weight=1)
+        top.grid_columnconfigure(3, weight=1)
+        tk.Label(top, text=self.tr("queue_server"), bg=SURFACE, fg=MUTED).grid(row=0, column=0, sticky="w")
+        ttk.Combobox(top, values=labels, textvariable=self.queue_server_var, state="readonly").grid(row=0, column=1, sticky="ew", padx=(8, 14))
+        tk.Label(top, text=self.tr("queue_dir"), bg=SURFACE, fg=MUTED).grid(row=0, column=2, sticky="w")
+        ttk.Entry(top, textvariable=self.queue_dir_var).grid(row=0, column=3, sticky="ew", padx=(8, 14))
+        ttk.Button(top, text=self.tr("install_sync"), command=self.queue_install).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(top, text=self.tr("refresh"), command=self.queue_refresh).grid(row=0, column=5)
+
+        actions = tk.Frame(body, bg=SURFACE, bd=1, relief="solid", padx=12, pady=10)
+        actions.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 10))
+        actions.grid_columnconfigure(1, weight=1)
+        tk.Label(actions, text=self.tr("add_job"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        self._queue_field(actions, 1, self.tr("name"), ttk.Entry(actions, textvariable=self.queue_name_var), col=0)
+        self._queue_field(actions, 2, self.tr("cwd"), ttk.Entry(actions, textvariable=self.queue_cwd_var), col=0)
+        self._queue_field(actions, 3, self.tr("command"), ttk.Entry(actions, textvariable=self.queue_command_var), col=0)
+        self._queue_field(actions, 4, self.tr("gpus"), ttk.Entry(actions, textvariable=self.queue_gpus_var, width=12), col=0)
+        self._queue_field(actions, 4, self.tr("queue"), ttk.Entry(actions, textvariable=self.queue_group_var, width=12), col=2)
+        self._queue_field(actions, 5, self.tr("priority"), ttk.Entry(actions, textvariable=self.queue_priority_var, width=12), col=0)
+        self._queue_field(actions, 5, self.tr("conda_env"), ttk.Entry(actions, textvariable=self.queue_conda_env_var, width=16), col=2)
+        ttk.Button(actions, text=self.tr("add_to_queue"), command=self.queue_add_job, style="Accent.TButton").grid(row=6, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+
+        daemon = tk.Frame(body, bg=SURFACE, bd=1, relief="solid", padx=12, pady=10)
+        daemon.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 10))
+        daemon.grid_columnconfigure(1, weight=1)
+        tk.Label(daemon, text=self.tr("operations"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Button(daemon, text="Doctor", command=lambda: self.queue_run_simple(["doctor"])).grid(row=1, column=0, sticky="ew", pady=(12, 0), padx=(0, 6))
+        ttk.Button(daemon, text=self.tr("daemon_status"), command=lambda: self.queue_run_simple(["daemon", "status"])).grid(row=1, column=1, sticky="ew", pady=(12, 0), padx=6)
+        ttk.Button(daemon, text=self.tr("start_daemon"), command=lambda: self.queue_run_simple(["daemon", "start"])).grid(row=1, column=2, sticky="ew", pady=(12, 0), padx=6)
+        ttk.Button(daemon, text=self.tr("stop_daemon"), command=lambda: self.queue_run_simple(["daemon", "stop"])).grid(row=1, column=3, sticky="ew", pady=(12, 0), padx=(6, 0))
+        ttk.Button(daemon, text=self.tr("queue_list"), command=lambda: self.queue_run_simple(["list", "--all"])).grid(row=2, column=0, sticky="ew", pady=(8, 0), padx=(0, 6))
+        ttk.Button(daemon, text="Status", command=lambda: self.queue_run_simple(["status", "--all"])).grid(row=2, column=1, sticky="ew", pady=(8, 0), padx=6)
+        ttk.Button(daemon, text=self.tr("daemon_logs"), command=lambda: self.queue_run_simple(["daemon", "logs", "--lines", "120"])).grid(row=2, column=2, sticky="ew", pady=(8, 0), padx=6)
+        self._queue_field(daemon, 3, self.tr("job_id"), ttk.Entry(daemon, textvariable=self.queue_job_id_var, width=10), col=0, pady=(14, 0))
+        ttk.Button(daemon, text=self.tr("show"), command=lambda: self.queue_job_action("show")).grid(row=4, column=0, sticky="ew", pady=(8, 0), padx=(0, 6))
+        ttk.Button(daemon, text=self.tr("logs"), command=lambda: self.queue_job_action("logs")).grid(row=4, column=1, sticky="ew", pady=(8, 0), padx=6)
+        ttk.Button(daemon, text=self.tr("retry"), command=lambda: self.queue_job_action("retry")).grid(row=4, column=2, sticky="ew", pady=(8, 0), padx=6)
+        ttk.Button(daemon, text=self.tr("cancel"), command=lambda: self.queue_job_action("cancel")).grid(row=4, column=3, sticky="ew", pady=(8, 0), padx=(6, 0))
+        ttk.Label(daemon, textvariable=self.queue_status_var, style="CardMuted.TLabel").grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        log_panel = tk.Frame(body, bg=SURFACE, bd=1, relief="solid", padx=12, pady=12)
+        log_panel.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        log_panel.grid_rowconfigure(1, weight=1)
+        log_panel.grid_columnconfigure(0, weight=1)
+        tk.Label(log_panel, text=self.tr("queue_output"), bg=SURFACE, fg=TEXT, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(log_panel, text=self.tr("clear"), command=lambda: self.queue_log.delete("1.0", "end")).grid(row=0, column=1, sticky="e")
+        self.queue_log = tk.Text(log_panel, height=18, wrap="word", font=("Consolas", 10), bg=DARK, fg="#d7e2ee", insertbackground="#d7e2ee", relief="flat")
+        self.queue_log.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+
+    def _queue_field(self, parent: tk.Frame, row: int, label: str, widget: tk.Widget, col: int = 0, pady: tuple[int, int] = (8, 0)) -> None:
+        tk.Label(parent, text=label, bg=SURFACE, fg=MUTED).grid(row=row, column=col, sticky="w", pady=pady, padx=(0, 8))
+        widget.grid(row=row, column=col + 1, sticky="ew", pady=pady, padx=(0, 8))
 
     def _bind_preview_updates(self) -> None:
         for var in (
@@ -964,10 +1287,10 @@ class App(tk.Tk):
             return
         self.refresh_running = True
         self._last_refresh_monotonic = time.monotonic()
-        self.summary_hint_var.set("正在刷新服务器 GPU 状态...")
+        self.summary_hint_var.set(self.tr("refreshing_gpu"))
         for server in self.servers:
-            self.status_vars[server.alias]["count"].set("连接中")
-            self.status_vars[server.alias]["status"].set(f"正在连接 {server.display_target}")
+            self.status_vars[server.alias]["count"].set(self.tr("connecting"))
+            self.status_vars[server.alias]["status"].set(f"{self.tr('connecting')} {server.display_target}")
             self._render_loading(server)
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
@@ -1009,6 +1332,12 @@ class App(tk.Tk):
                     self.migration_step_var.set(str(payload))
                 elif kind == "migration_done":
                     self._finish_migration(str(payload))
+                elif kind == "queue_log":
+                    self._append_queue_log(str(payload))
+                elif kind == "queue_state":
+                    self.queue_status_var.set(str(payload))
+                elif kind == "queue_done":
+                    self._finish_queue_command(str(payload))
         except queue.Empty:
             pass
         self.after(200, self._poll_queue)
@@ -1025,7 +1354,7 @@ class App(tk.Tk):
             frame = self.gpu_frames[server.alias]
 
             if error:
-                vars_for_server["count"].set("连接失败")
+                vars_for_server["count"].set(self.tr("connection_failed"))
                 vars_for_server["status"].set(error)
                 self.count_labels[server.alias].configure(bg=RED_BG, fg=RED)
                 self._show_server_error(server.alias, frame, "无法读取 nvidia-smi，请检查 SSH 免密、网络或服务器状态。")
@@ -1037,18 +1366,18 @@ class App(tk.Tk):
             total_free += free_count
             count_bg = GREEN_BG if free_count else RED_BG
             count_fg = GREEN if free_count else RED
-            vars_for_server["count"].set(f"空闲 {free_count}/{len(gpus)}")
+            vars_for_server["count"].set(f"{self.tr('free_count')} {free_count}/{len(gpus)}")
             vars_for_server["status"].set(f"SSH: {server.display_target}")
             self.count_labels[server.alias].configure(bg=count_bg, fg=count_fg)
             self._gpu_grid(server.alias, frame, gpus, util_threshold, mem_threshold)
 
         busy = max(0, total_gpus - total_free)
         stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.last_refresh_at.set(f"最后刷新: {stamp}")
+        self.last_refresh_at.set(f"{self.tr('last_refresh')}: {stamp}")
         self.summary_free_var.set(f"{total_free}/{total_gpus}")
         self.summary_online_var.set(f"{online}/{len(self.servers)}")
         self.summary_busy_var.set(str(busy))
-        self.summary_hint_var.set("绿色表示当前空闲，红色表示正在使用或显存占用超过阈值。")
+        self.summary_hint_var.set(self.tr("idle_hint"))
         self.refresh_running = False
 
     def _error_panel(self, parent: tk.Frame, text: str) -> None:
@@ -1244,6 +1573,118 @@ class App(tk.Tk):
         self.migrate_button.configure(state="normal")
         self.migration_step_var.set("已结束")
         self._append_migration_log(message)
+
+    def _queue_server(self) -> Server | None:
+        server = self.server_by_label.get(self.queue_server_var.get())
+        if server is None:
+            messagebox.showerror("Server Error", "Select a Queue Runner server.")
+        return server
+
+    def _queue_dir(self) -> str:
+        return self.queue_dir_var.get().strip() or DEFAULT_QUEUE_RUNNER_DIR
+
+    def _append_queue_log(self, text: str) -> None:
+        self.queue_log.insert("end", text)
+        if not text.endswith("\n"):
+            self.queue_log.insert("end", "\n")
+        self.queue_log.see("end")
+
+    def _start_queue_thread(self, label: str, worker) -> None:
+        if self.queue_running:
+            return
+        self.queue_running = True
+        self.queue_status_var.set(label)
+        self._append_queue_log(f"\n[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {label}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_queue_command(self, message: str) -> None:
+        self.queue_running = False
+        self.queue_status_var.set("Ready")
+        if message:
+            self._append_queue_log(message)
+
+    def queue_install(self) -> None:
+        server = self._queue_server()
+        if server is None:
+            return
+        if not LOCAL_GPUQ_FILE.exists():
+            messagebox.showerror("Missing gpuq", f"Cannot find local gpuq script:\n{LOCAL_GPUQ_FILE}")
+            return
+        remote_dir = self._queue_dir()
+
+        def worker() -> None:
+            try:
+                payload = base64.b64encode(LOCAL_GPUQ_FILE.read_bytes()).decode("ascii")
+                proc = run_remote_script(server, gpuq_install_script(remote_dir, payload), timeout_s=600)
+                if proc.stdout:
+                    self.result_queue.put(("queue_log", proc.stdout))
+                if proc.stderr:
+                    self.result_queue.put(("queue_log", proc.stderr))
+                self.result_queue.put(("queue_done", f"Install finished with exit code {proc.returncode}\n"))
+            except Exception as exc:
+                self.result_queue.put(("queue_done", f"Install failed: {exc}\n"))
+
+        self._start_queue_thread(f"Installing gpuq on {server.label}", worker)
+
+    def queue_refresh(self) -> None:
+        self.queue_run_simple(["status", "--all"])
+
+    def queue_run_simple(self, args: list[str]) -> None:
+        server = self._queue_server()
+        if server is None:
+            return
+        remote_dir = self._queue_dir()
+
+        def worker() -> None:
+            try:
+                proc = run_remote_script(server, gpuq_command_script(remote_dir, args), timeout_s=600)
+                command = " ".join(args)
+                self.result_queue.put(("queue_log", f"$ ./gpuq {command}\n"))
+                if proc.stdout:
+                    self.result_queue.put(("queue_log", proc.stdout))
+                if proc.stderr:
+                    self.result_queue.put(("queue_log", proc.stderr))
+                self.result_queue.put(("queue_done", f"Command exit code: {proc.returncode}\n"))
+            except Exception as exc:
+                self.result_queue.put(("queue_done", f"Command failed: {exc}\n"))
+
+        self._start_queue_thread(f"Running gpuq {' '.join(args)}", worker)
+
+    def queue_add_job(self) -> None:
+        name = self.queue_name_var.get().strip()
+        cwd = self.queue_cwd_var.get().strip()
+        command = self.queue_command_var.get().strip()
+        gpus = self.queue_gpus_var.get().strip()
+        queue_name = self.queue_group_var.get().strip()
+        priority = self.queue_priority_var.get().strip()
+        conda_env = self.queue_conda_env_var.get().strip()
+        if not cwd or not command:
+            messagebox.showerror("Missing Field", "CWD and Command are required.")
+            return
+        args = ["add", "--cwd", cwd, "--command", command]
+        if name:
+            args.extend(["--name", name])
+        if gpus:
+            args.extend(["--gpus", gpus])
+        if queue_name:
+            args.extend(["--queue", queue_name])
+        if priority:
+            args.extend(["--priority", priority])
+        if conda_env:
+            args.extend(["--conda-env", conda_env])
+        self.queue_run_simple(args)
+
+    def queue_job_action(self, action: str) -> None:
+        job_id = self.queue_job_id_var.get().strip()
+        if not job_id:
+            messagebox.showerror("Missing Job ID", "Enter a job ID first.")
+            return
+        if action == "logs":
+            self.queue_run_simple(["logs", job_id, "--lines", "120"])
+        elif action == "cancel":
+            self.queue_run_simple(["cancel", job_id, "--force"])
+        else:
+            self.queue_run_simple([action, job_id])
 
 
 def main() -> int:

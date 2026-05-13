@@ -1,0 +1,2518 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+from typing import Any
+
+
+BASE_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR = BASE_DIR / ".gpuq"
+STATE_FILE = RUNTIME_DIR / "state.json"
+CONFIG_FILE = RUNTIME_DIR / "config.json"
+LOCK_FILE = RUNTIME_DIR / "state.lock"
+LOG_DIR = RUNTIME_DIR / "logs"
+RUN_DIR = RUNTIME_DIR / "runs"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "poll_interval_s": 15,
+    "idle_util_threshold": 5,
+    "idle_mem_threshold_mb": 2000,
+    "idle_streak_required": 3,
+    "launch_hold_s": 120,
+    "default_gpus": "",
+    "default_queue": "default",
+    "default_priority": 0,
+    "default_conda_env": "",
+    "screen_prefix": "gpuq-job",
+    "daemon_session_name": "gpuq-daemon",
+    "set_cuda_visible_devices": True,
+    "shell": "/bin/bash",
+    "history_limit": 30,
+}
+
+DEFAULT_STATE: dict[str, Any] = {
+    "version": 1,
+    "next_job_id": 1,
+    "jobs": [],
+}
+
+STATUS_STYLES: dict[str, dict[str, Any]] = {
+    "queued": {"color": "yellow", "symbol": "○", "label": "queued"},
+    "running": {"color": "green", "symbol": "●", "label": "running"},
+    "completed": {"color": "cyan", "symbol": "✓", "label": "done"},
+    "failed": {"color": "red", "symbol": "✗", "label": "failed"},
+    "canceled": {"color": "magenta", "symbol": "⊘", "label": "canceled"},
+}
+
+QUEUE_COLORS = ["cyan", "yellow", "green", "blue", "magenta"]
+
+BOX = {
+    "h": "─",
+    "v": "│",
+    "tl": "┌",
+    "tr": "┐",
+    "bl": "└",
+    "br": "┘",
+    "ml": "├",
+    "mr": "┤",
+    "mt": "┬",
+    "mb": "┴",
+    "x": "┼",
+}
+
+
+class CliError(RuntimeError):
+    pass
+
+
+def ensure_layout() -> None:
+    for path in (RUNTIME_DIR, LOG_DIR, RUN_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        write_json(CONFIG_FILE, DEFAULT_CONFIG)
+    if not STATE_FILE.exists():
+        write_json(STATE_FILE, DEFAULT_STATE)
+    LOCK_FILE.touch(exist_ok=True)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return json.loads(json.dumps(default))
+    with path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def write_json(path: Path, data: Any) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def state_lock(timeout: float | None = None):
+    ensure_layout()
+    with LOCK_FILE.open("a+", encoding="utf-8") as fh:
+        fd = fh.fileno()
+        if timeout is not None:
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, OSError):
+                    if time.time() >= deadline:
+                        raise CliError("状态文件被锁定，请稍后重试（守护进程可能正在操作）")
+                    time.sleep(0.1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+
+
+def migrate_job(job: dict[str, Any]) -> None:
+    job.setdefault("priority", 0)
+    job.setdefault("queue", "default")
+    job.setdefault("scheduled_after", None)
+    job.setdefault("conda_env", "")
+
+
+def load_state() -> dict[str, Any]:
+    state = read_json(STATE_FILE, DEFAULT_STATE)
+    if "jobs" not in state:
+        state["jobs"] = []
+    if "next_job_id" not in state:
+        state["next_job_id"] = 1
+    for job in state["jobs"]:
+        migrate_job(job)
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    write_json(STATE_FILE, state)
+
+
+def load_config() -> dict[str, Any]:
+    config = DEFAULT_CONFIG.copy()
+    config.update(read_json(CONFIG_FILE, {}))
+    return config
+
+
+def save_config(config: dict[str, Any]) -> None:
+    write_json(CONFIG_FILE, config)
+
+
+def now() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def now_iso() -> str:
+    return now().replace(microsecond=0).isoformat()
+
+
+def parse_time(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    return dt.datetime.fromisoformat(value)
+
+
+def format_time(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        ts = parse_time(value)
+        assert ts is not None
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return value
+
+
+def format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "-"
+    total = int(max(0, seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def is_tty() -> bool:
+    return sys.stdout.isatty()
+
+
+def style(text: str, color: str | None = None, bold: bool = False, dim: bool = False) -> str:
+    if not is_tty() or not color:
+        return text
+    codes: dict[str, str] = {
+        "red": "31",
+        "green": "32",
+        "yellow": "33",
+        "blue": "34",
+        "magenta": "35",
+        "cyan": "36",
+        "white": "37",
+        "gray": "90",
+        "bright_red": "91",
+        "bright_green": "92",
+        "bright_yellow": "93",
+        "bright_blue": "94",
+        "bright_magenta": "95",
+        "bright_cyan": "96",
+    }
+    parts: list[str] = []
+    if bold:
+        parts.append("1")
+    if dim:
+        parts.append("2")
+    parts.append(codes[color])
+    return f"\033[{';'.join(parts)}m{text}\033[0m"
+
+
+def banner(title: str) -> str:
+    return style(title, "blue", bold=True)
+
+
+def clear_screen() -> None:
+    if is_tty():
+        print("\033[2J\033[H", end="")
+
+
+def shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def run_command(parts: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(parts, text=True, capture_output=True, check=check)
+
+
+def require_binary(name: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        raise CliError(f"找不到依赖命令: {name}")
+    return path
+
+
+def slugify(value: str, fallback: str = "job") -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-_.")
+    return slug or fallback
+
+
+def get_term_width(fallback: int = 120) -> int:
+    try:
+        return os.get_terminal_size().columns
+    except (OSError, ValueError):
+        return fallback
+
+
+def shorten(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if _cell_width(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
+def prompt(label: str, default: str | None = None, allow_empty: bool = False) -> str:
+    if not is_tty():
+        if default is not None:
+            return default
+        if allow_empty:
+            return ""
+        raise CliError(f"非交互模式需要提供完整参数，缺少: {label}")
+    while True:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        raw = input(f"{label}{suffix}: ").strip()
+        if raw:
+            return raw
+        if default is not None:
+            return default
+        if allow_empty:
+            return ""
+        print("这个字段不能为空。")
+
+
+def parse_schedule(raw: str) -> str | None:
+    """Parse schedule string: absolute datetime, +2h, +30m, or empty for immediate."""
+    text = raw.strip()
+    if not text:
+        return None
+    if text.startswith("+"):
+        total_s = 0
+        for m in re.finditer(r"(\d+)\s*(h|m|s)", text[1:], re.IGNORECASE):
+            val = int(m.group(1))
+            unit = m.group(2).lower()
+            if unit == "h":
+                total_s += val * 3600
+            elif unit == "m":
+                total_s += val * 60
+            else:
+                total_s += val
+        if total_s > 0:
+            return (now() + dt.timedelta(seconds=total_s)).replace(microsecond=0).isoformat()
+    try:
+        ts = dt.datetime.fromisoformat(text)
+        return ts.isoformat()
+    except ValueError:
+        pass
+    try:
+        ts = dt.datetime.strptime(text, "%Y-%m-%d %H:%M")
+        return ts.astimezone().isoformat()
+    except ValueError:
+        pass
+    try:
+        ts = dt.datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        return ts.astimezone().isoformat()
+    except ValueError:
+        pass
+    raise CliError(f"无法解析时间: {text}（支持: 2026-05-01 08:00, +2h, +30m, +1h30m）")
+
+
+class InteractiveForm:
+    """ANSI-based multi-field form for job creation."""
+
+    def __init__(self, defaults: dict[str, Any], metrics: list[dict[str, Any]]):
+        self.defaults = defaults
+        self.metrics = metrics
+        self.fields: list[dict[str, Any]] = [
+            {
+                "key": "name",
+                "label": "任务名",
+                "value": defaults.get("name", ""),
+                "hint": "任务描述名称",
+                "required": True,
+            },
+            {
+                "key": "queue",
+                "label": "队列",
+                "value": defaults.get("queue", "default"),
+                "hint": "队列名，用于分组管理",
+                "required": False,
+            },
+            {
+                "key": "command",
+                "label": "运行命令",
+                "value": defaults.get("command", ""),
+                "hint": "要执行的 shell 命令或脚本",
+                "required": True,
+            },
+            {
+                "key": "conda_env",
+                "label": "Conda 环境",
+                "value": defaults.get("conda_env", ""),
+                "hint": "Conda 环境名，留空不激活（会自动 source conda.sh）",
+                "required": False,
+            },
+            {
+                "key": "cwd",
+                "label": "工作目录",
+                "value": defaults.get("cwd", ""),
+                "hint": "命令执行时的工作目录",
+                "required": True,
+            },
+            {
+                "key": "gpus",
+                "label": "GPU 列表",
+                "value": defaults.get("gpus", ""),
+                "hint": "逗号分隔，如 0,1,2；留空=全部",
+                "required": False,
+            },
+            {
+                "key": "priority",
+                "label": "优先级",
+                "value": str(defaults.get("priority", 0)),
+                "hint": "数字越大越优先，0=默认",
+                "required": False,
+            },
+            {
+                "key": "schedule",
+                "label": "定时启动",
+                "value": defaults.get("schedule", ""),
+                "hint": "留空=立即；支持 +2h, +30m, 2026-05-01 08:00",
+                "required": False,
+            },
+            {
+                "key": "launch_hold_s",
+                "label": "启动保护(s)",
+                "value": str(defaults.get("launch_hold_s", "")),
+                "hint": "任务启动后保护时间，留空用默认",
+                "required": False,
+            },
+        ]
+        self._cursor = 0
+        self._editing = -1
+        self._edit_buf = ""
+        self._message = ""
+        self._submitted = False
+
+    def _move_cursor(self, delta: int) -> None:
+        self._cursor = max(0, min(len(self.fields) - 1, self._cursor + delta))
+
+    def _render(self) -> str:
+        lines: list[str] = []
+        lines.append(clear_screen_raw())
+        lines.append(banner("╔══════════════════════════════════════╗"))
+        lines.append(banner("║         GPU Queue - 添加任务          ║"))
+        lines.append(banner("╚══════════════════════════════════════╝"))
+        lines.append("")
+        lines.append(style("  ↑↓ 选择字段  Enter 编辑  Tab 提交  Esc 取消", "gray"))
+        lines.append("")
+
+        for i, field in enumerate(self.fields):
+            cursor = style(">", "bright_cyan", bold=True) if i == self._cursor else " "
+            label = field["label"]
+            key = field["key"]
+            val = field["value"]
+
+            if i == self._editing:
+                display_val = self._edit_buf + style("█", "bright_cyan")
+            elif val:
+                if key == "priority":
+                    p = int(val) if val.lstrip("-").isdigit() else 0
+                    display_val = f"{priority_symbol(p)} {val}"
+                elif key == "queue":
+                    display_val = style(val, queue_color(val))
+                elif key == "schedule":
+                    display_val = style(val, "bright_yellow") if val else style("立即", "gray", dim=True)
+                elif key == "gpus":
+                    display_val = style(val, "bright_cyan") if val else style("全部 GPU", "gray", dim=True)
+                else:
+                    display_val = val
+            else:
+                display_val = style("(未设置)", "gray", dim=True)
+
+            hint = style(f"  ← {field['hint']}", "gray") if not display_val or display_val == style("(未设置)", "gray", dim=True) else ""
+            lines.append(f"   {cursor} {style(label + ':', 'white', bold=True):<18} {display_val}{hint}")
+
+        lines.append("")
+        if self._message:
+            lines.append(f"  {self._message}")
+        lines.append("")
+        lines.append(style("  ─────────────────────────────────────", "gray"))
+        # GPU reference
+        if self.metrics:
+            lines.append(style("  可用 GPU:", "gray"))
+            for gpu in self.metrics:
+                lines.append(
+                    style(
+                        f"    GPU {gpu['index']}: {gpu['name']}  {render_gpu_bar(gpu['util'])} {gpu['util']}%  {gpu['mem_used']}/{gpu['mem_total']} MB",
+                        "gray",
+                    )
+                )
+        return "\r\n".join(lines)
+
+    def _edit_field(self, idx: int) -> None:
+        field = self.fields[idx]
+        self._editing = idx
+        self._edit_buf = field["value"]
+        self._message = style("输入新值，Enter 确认，Esc 取消", "bright_yellow")
+
+    def _commit_edit(self) -> None:
+        if self._editing < 0:
+            return
+        field = self.fields[self._editing]
+        val = self._edit_buf.strip()
+        if field.get("required") and not val:
+            self._message = style(f"{field['label']} 不能为空", "red")
+            return
+        field["value"] = val
+        self._editing = -1
+        self._edit_buf = ""
+        self._message = ""
+
+    def _cancel_edit(self) -> None:
+        self._editing = -1
+        self._edit_buf = ""
+        self._message = ""
+
+    def _submit(self) -> dict[str, str]:
+        missing = []
+        for f in self.fields:
+            if f.get("required") and not f["value"].strip():
+                missing.append(f["label"])
+        if missing:
+            self._message = style(f"必填字段未填: {', '.join(missing)}", "red")
+            return {}
+        self._submitted = True
+        return {f["key"]: f["value"] for f in self.fields}
+
+    def run(self, already_raw: bool = False) -> dict[str, str] | None:
+        if not is_tty():
+            return None
+        try:
+            import termios
+            import tty
+        except ImportError:
+            return None
+
+        fd = sys.stdin.fileno()
+        old_settings = None if already_raw else termios.tcgetattr(fd)
+        try:
+            if not already_raw:
+                tty.setraw(fd)
+            sys.stdout.write(enter_alt_screen())
+            sys.stdout.write(hide_cursor())
+            sys.stdout.flush()
+            self._run_raw()
+        finally:
+            sys.stdout.write(leave_alt_screen())
+            sys.stdout.write(show_cursor())
+            sys.stdout.flush()
+            if not already_raw and old_settings is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if not already_raw:
+                print()
+
+        if self._submitted:
+            return {f["key"]: f["value"] for f in self.fields}
+        return None
+
+    def _run_raw(self) -> None:
+        while not self._submitted:
+            self._redraw()
+            ch = _read_keyboard(0.10)
+            if not ch:
+                continue
+
+            if self._editing >= 0:
+                self._handle_edit_key(ch)
+            else:
+                self._handle_nav_key(ch)
+
+    def _handle_nav_key(self, ch: str) -> None:
+        if ch in ("\x1b", "q"):
+            self._submitted = False
+            return
+        elif ch == "\t":
+            self._submit()
+        elif ch in ("\r", "\n"):
+            self._edit_field(self._cursor)
+        elif ch == "\x1b[A":
+            self._move_cursor(-1)
+        elif ch == "\x1b[B":
+            self._move_cursor(1)
+        elif ch == "\x03":
+            self._submitted = False
+            return
+
+    def _handle_edit_key(self, ch: str) -> None:
+        if ch == "\x1b":
+            self._cancel_edit()
+        elif ch in ("\r", "\n"):
+            self._commit_edit()
+        elif ch == "\x7f":
+            self._edit_buf = self._edit_buf[:-1]
+        elif ch == "\x03":
+            self._cancel_edit()
+        elif len(ch) == 1 and ord(ch) >= 32:
+            self._edit_buf += ch
+
+    def _redraw(self) -> None:
+        sys.stdout.write(clear_screen_raw() + self._render())
+        sys.stdout.flush()
+
+
+def clear_screen_raw() -> str:
+    return "\033[H\033[J"
+
+
+def enter_alt_screen() -> str:
+    return "\033[?1049h"
+
+
+def leave_alt_screen() -> str:
+    return "\033[?1049l"
+
+
+def show_cursor() -> str:
+    return "\033[?25h"
+
+
+def hide_cursor() -> str:
+    return "\033[?25l"
+
+
+# ── shared raw terminal input ─────────────────────────────────
+
+
+def _read_raw_input(timeout: float = 0.05) -> str:
+    """Read a complete input sequence from stdin in raw mode.
+
+    Handles plain keys, escape sequences (arrows, etc.), and Ctrl+key combos.
+    Uses select on the raw fd for portability.
+    Returns '' on timeout, single char for plain keys, or full escape sequence.
+    """
+    import os as _os
+    import select as _sel
+
+    fd = sys.stdin.fileno()
+    r, _, _ = _sel.select([fd], [], [], timeout)
+    if not r:
+        return ""
+    # Read first byte
+    data = _os.read(fd, 1)
+    if not data:
+        return ""
+    first = data.decode("latin-1")
+    if first != "\x1b":
+        return first
+    # Escape sequence — buffer remaining bytes with a longer timeout
+    buf = "\x1b"
+    deadline = time.time() + 0.10
+    while time.time() < deadline:
+        r2, _, _ = _sel.select([fd], [], [], max(0, deadline - time.time()))
+        if not r2:
+            break
+        data = _os.read(fd, 1)
+        if not data:
+            break
+        buf += data.decode("latin-1")
+        # Common escape sequences are 2-6 bytes; stop when we have enough
+        if len(buf) >= 6:
+            break
+    return buf
+
+
+def _read_keyboard(timeout: float = 0.08) -> str:
+    """Shorthand wrapper used by both Dashboard and form."""
+    return _read_raw_input(timeout)
+
+
+class Dashboard:
+    """Full-screen interactive TUI like top/htop for GPU queue management."""
+
+    def __init__(self) -> None:
+        self._quit = False
+        self._jobs: list[dict[str, Any]] = []
+        self._metrics: list[dict[str, Any]] = []
+        self._config: dict[str, Any] = {}
+        self._cursor = 0
+        self._scroll = 0
+        self._message = ""
+        self._modal: str | None = None
+        self._modal_data: Any = None
+        self._sort_mode = "priority"
+        self._filter_queue: str | None = None
+        self._refresh_interval = 2.0
+
+    # ── raw terminal helpers ──────────────────────────────────────
+
+    def _enter_raw(self) -> Any:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        return old
+
+    def _leave_raw(self, old: Any) -> None:
+        import termios
+
+        fd = sys.stdin.fileno()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    # ── data loading ──────────────────────────────────────────────
+
+    def _reload(self) -> None:
+        try:
+            self._metrics = load_gpu_metrics()
+        except Exception:
+            pass
+        try:
+            with state_lock(timeout=1.0):
+                self._config = load_config()
+                state = load_state()
+                jobs = sorted(state["jobs"], key=job_sort_key)
+                if self._filter_queue:
+                    jobs = [j for j in jobs if j.get("queue", "default") == self._filter_queue]
+                self._jobs = jobs
+        except CliError:
+            pass  # lock busy, keep old data
+        self._clamp_cursor()
+
+    def _clamp_cursor(self) -> None:
+        max_idx = max(0, len(self._jobs) - 1)
+        self._cursor = max(0, min(self._cursor, max_idx))
+
+    def _open_modal(self, kind: str, data: Any = None) -> None:
+        self._modal = kind
+        self._modal_data = data
+
+    def _render_modal(self) -> list[str]:
+        lines: list[str] = []
+        term_w = get_term_width(80)
+        mw = max(40, min(term_w - 4, 72))
+        b = BOX
+        sep_h = b["h"]
+
+        def _box(title: str, content: list[str]) -> list[str]:
+            inner = mw - 2
+            box_lines = [
+                b["tl"] + sep_h * inner + b["tr"],
+                b["v"] + style(title.center(inner), "white", bold=True) + b["v"],
+                b["ml"] + sep_h * inner + b["mr"],
+            ]
+            for cl in content:
+                for sub in cl.split("\n"):
+                    box_lines.append(b["v"] + " " + _pad(sub, inner - 1) + b["v"])
+            box_lines.append(b["bl"] + sep_h * inner + b["br"])
+            return box_lines
+
+        if self._modal == "help":
+            lines.extend(
+                _box(
+                    "帮助",
+                    [
+                        style("a", "bright_cyan") + "  添加任务       " + style("c", "bright_cyan") + "  取消任务",
+                        style("r", "bright_cyan") + "  重试任务       " + style("p", "bright_cyan") + "  修改优先级",
+                        style("d", "bright_cyan") + "  启停守护进程   " + style("f", "bright_cyan") + "  切换队列筛选",
+                        style("s", "bright_cyan") + "  切换排序       " + style("l", "bright_cyan") + "  查看日志",
+                        style("Enter", "bright_cyan") + " 查看详情     " + style("↑↓", "bright_cyan") + " 导航",
+                        style("q", "bright_cyan") + "  退出           " + style("Esc", "bright_cyan") + " 关闭弹窗",
+                        "",
+                        style("按任意键返回", "gray"),
+                    ],
+                )
+            )
+        elif self._modal == "detail":
+            job = self._modal_data
+            if job:
+                lines.extend(_box(f"Job {job['id']}", render_job_detail(job).split("\n")))
+                lines.extend([style("  Esc 关闭  c 取消  x 删除  r 重试  l 日志  p 改优先级", "gray")])
+        elif self._modal == "confirm":
+            msg, action = self._modal_data
+            lines.extend(_box("确认", [msg, "", style("y/Enter 确认  n/Esc 取消", "bright_yellow")]))
+        elif self._modal == "input":
+            prompt_text, callback_key = self._modal_data
+            buf_display = getattr(self, "_input_buf", "")
+            lines.extend(_box("输入", [
+                prompt_text,
+                "",
+                style(f"> {buf_display}" + ("█" if buf_display or True else ""), "bright_cyan", bold=True),
+                "",
+                style("Enter 确认  Esc 取消", "gray"),
+            ]))
+
+        return lines
+
+    # ── key handling ──────────────────────────────────────────────
+
+    def _read_key(self, timeout: float = 0.1) -> str:
+        return _read_keyboard(timeout)
+
+    def _handle_key(self, key: str) -> bool:
+        if self._modal:
+            return self._handle_modal_key(key)
+
+        if key in ("q", "\x1b"):
+            self._quit = True
+            return True
+        elif key == "\x1b[A" or key == "k":
+            self._cursor = max(0, self._cursor - 1)
+            if self._cursor < self._scroll:
+                self._scroll = self._cursor
+        elif key == "\x1b[B" or key == "j":
+            self._cursor = min(len(self._jobs) - 1, self._cursor + 1) if self._jobs else 0
+            visible_h = max(10, os.get_terminal_size().lines - 24 if is_tty() else 20)
+            if self._cursor >= self._scroll + visible_h:
+                self._scroll = self._cursor - visible_h + 1
+        elif key == "a":
+            self._do_add()
+        elif key == "c":
+            self._do_cancel()
+        elif key == "x":
+            self._do_remove()
+        elif key == "r":
+            self._do_retry()
+        elif key == "p":
+            self._do_prioritize()
+        elif key == "d":
+            self._do_daemon_toggle()
+        elif key == "f":
+            self._do_filter()
+        elif key == "s":
+            self._do_sort_cycle()
+        elif key == "l":
+            self._do_logs()
+        elif key in ("\r", "\n"):
+            self._do_detail()
+        elif key == "?":
+            self._modal = "help"
+        elif key == "\x03":
+            self._quit = True
+            return True
+        self._message = ""
+        return False
+
+    def _handle_modal_key(self, key: str) -> bool:
+        # Esc always closes any modal (except input where it cancels edit)
+        if key == "\x1b" and self._modal not in ("input",):
+            self._modal = None
+            return False
+
+        if self._modal == "help":
+            if key and not key.startswith("\x1b["):
+                self._modal = None
+        elif self._modal == "detail":
+            if key == "q":
+                self._modal = None
+            elif key == "c":
+                self._modal = None
+                self._do_cancel()
+            elif key == "x":
+                self._modal = None
+                self._do_remove()
+            elif key == "r":
+                self._modal = None
+                self._do_retry()
+            elif key == "p":
+                self._modal = None
+                self._do_prioritize()
+            elif key == "l":
+                self._modal = None
+                self._do_logs()
+        elif self._modal == "confirm":
+            if key in ("y", "\r", "\n"):
+                _, action = self._modal_data
+                self._modal = None
+                action()
+            elif key == "n":
+                self._modal = None
+        elif self._modal == "input":
+            if key == "\x1b":
+                self._modal = None
+            elif key in ("\r", "\n"):
+                _, callback = self._modal_data
+                self._modal = None
+                callback()
+            elif key == "\x7f":
+                self._input_buf = self._input_buf[:-1]
+            elif len(key) == 1 and ord(key) >= 32:
+                self._input_buf += key
+        return False
+
+    # ── actions ───────────────────────────────────────────────────
+
+    def _do_add(self) -> None:
+        self._message = ""
+        try:
+            metrics = load_gpu_metrics()
+            form = InteractiveForm(
+                {
+                    "name": "",
+                    "queue": self._filter_queue or self._config.get("default_queue", "default"),
+                    "command": "",
+                    "cwd": str(BASE_DIR),
+                    "gpus": "",
+                    "priority": self._config.get("default_priority", 0),
+                    "schedule": "",
+                    "launch_hold_s": str(self._config.get("launch_hold_s", "")),
+                },
+                metrics,
+            )
+            result = form.run(already_raw=True)
+            if result is None:
+                result = fallback_add_form(self._config, metrics, argparse.Namespace(
+                    name=None, command=None, cwd=None, gpus=None,
+                    queue=self._filter_queue, priority=None, schedule_at=None,
+                    launch_hold_s=None,
+                ))
+            if result:
+                launch_hold_raw = (result.get("launch_hold_s") or "").strip()
+                args = argparse.Namespace(
+                    name=result.get("name"),
+                    command=result.get("command"),
+                    cwd=result.get("cwd"),
+                    gpus=result.get("gpus"),
+                    queue=result.get("queue"),
+                    priority=int(result.get("priority", 0)) if result.get("priority") else None,
+                    schedule_at=result.get("schedule"),
+                    conda_env=result.get("conda_env"),
+                    launch_hold_s=int(launch_hold_raw) if launch_hold_raw else None,
+                    idle_util_threshold=None,
+                    idle_mem_threshold_mb=None,
+                    idle_streak_required=None,
+                    set_cuda_visible_devices=None,
+                )
+                cmd_add(args)
+                self._message = style("任务已添加", "green")
+        except Exception as e:
+            self._message = style(f"添加失败: {e}", "red")
+
+    def _do_cancel(self) -> None:
+        try:
+            if not self._jobs or self._cursor >= len(self._jobs):
+                return
+            job = self._jobs[self._cursor]
+            if job["status"] not in ("queued", "running"):
+                self._message = style("只能取消 queued/running 任务", "red")
+                return
+            def _force_cancel():
+                try:
+                    args = argparse.Namespace(job_id=job["id"], force=True)
+                    cmd_cancel(args)
+                    self._message = style(f"已取消任务 {job['id']}", "green")
+                except CliError as e:
+                    self._message = style(str(e), "red")
+            if job["status"] == "running":
+                self._open_modal("confirm", (f"强制取消运行中的任务 {job['id']} ({job['name']})?", _force_cancel))
+            else:
+                args = argparse.Namespace(job_id=job["id"], force=False)
+                cmd_cancel(args)
+                self._message = style(f"已取消任务 {job['id']}", "green")
+        except CliError as e:
+            self._message = style(str(e), "red")
+
+    def _do_remove(self) -> None:
+        try:
+            if not self._jobs or self._cursor >= len(self._jobs):
+                return
+            job = self._jobs[self._cursor]
+            if job["status"] == "running":
+                self._message = style("运行中的任务不能删除，请先 cancel", "red")
+                return
+            def _force_remove():
+                try:
+                    args = argparse.Namespace(job_id=job["id"])
+                    cmd_remove(args)
+                    self._message = style(f"已删除任务 {job['id']}", "green")
+                except CliError as e:
+                    self._message = style(str(e), "red")
+            self._open_modal("confirm", (f"删除任务 {job['id']} ({job['name']})?", _force_remove))
+        except CliError as e:
+            self._message = style(str(e), "red")
+
+    def _do_retry(self) -> None:
+        if not self._jobs or self._cursor >= len(self._jobs):
+            return
+        job = self._jobs[self._cursor]
+        if job["status"] not in ("failed", "completed", "canceled"):
+            self._message = style("只能重试已结束的任务", "red")
+            return
+        try:
+            args = argparse.Namespace(job_id=job["id"])
+            cmd_retry(args)
+            self._message = style(f"任务 {job['id']} 已重新排队", "green")
+        except CliError as e:
+            self._message = style(str(e), "red")
+
+    def _do_prioritize(self) -> None:
+        if not self._jobs or self._cursor >= len(self._jobs):
+            return
+        job = self._jobs[self._cursor]
+        def _set_prio():
+            try:
+                new_p = int(self._input_buf)
+                args = argparse.Namespace(job_id=job["id"], priority=new_p)
+                cmd_prioritize(args)
+                self._message = style(f"优先级已更新", "green")
+            except (ValueError, CliError) as e:
+                self._message = style(str(e), "red")
+        self._input_buf = str(job.get("priority", 0))
+        def _commit_prio():
+            _set_prio()
+        self._open_modal("input", (f"任务 {job['id']} 新优先级:", _commit_prio))
+
+    def _do_daemon_toggle(self) -> None:
+        daemon_session = self._config.get("daemon_session_name", "gpuq-daemon")
+        if screen_exists(daemon_session):
+            cmd_daemon_stop(argparse.Namespace())
+            self._message = style("守护进程已停止", "yellow")
+        else:
+            cmd_daemon_start(argparse.Namespace())
+            self._message = style("守护进程已启动", "green")
+
+    def _do_filter(self) -> None:
+        with state_lock():
+            state = load_state()
+        all_queues = sorted({j.get("queue", "default") for j in state["jobs"]})
+        if not all_queues:
+            all_queues = ["default"]
+        try:
+            idx = all_queues.index(self._filter_queue) if self._filter_queue in all_queues else -1
+            idx = (idx + 1) % (len(all_queues) + 1)
+            self._filter_queue = all_queues[idx] if idx < len(all_queues) else None
+        except ValueError:
+            self._filter_queue = None
+
+    def _do_sort_cycle(self) -> None:
+        modes = ["priority", "id", "status"]
+        try:
+            idx = modes.index(self._sort_mode)
+        except ValueError:
+            idx = 0
+        self._sort_mode = modes[(idx + 1) % len(modes)]
+        global job_sort_key
+        if self._sort_mode == "id":
+
+            def _by_id(j: dict[str, Any]) -> tuple[int, int]:
+                return (0, int(j["id"]))
+
+            job_sort_key = _by_id
+        elif self._sort_mode == "status":
+            status_order = {"running": 0, "queued": 1, "completed": 2, "failed": 3, "canceled": 4}
+
+            def _by_status(j: dict[str, Any]) -> tuple[int, int]:
+                return (status_order.get(j["status"], 9), int(j["id"]))
+
+            job_sort_key = _by_status
+        else:
+
+            def _by_priority(j: dict[str, Any]) -> tuple[int, int]:
+                return (-int(j.get("priority", 0)), int(j["id"]))
+
+            job_sort_key = _by_priority
+
+    def _do_logs(self) -> None:
+        if not self._jobs or self._cursor >= len(self._jobs):
+            return
+        job = self._jobs[self._cursor]
+        if not job.get("log_path"):
+            self._message = style("该任务还没有日志", "yellow")
+            return
+        log_path = Path(job["log_path"])
+        if not log_path.exists():
+            self._message = style("日志文件不存在", "yellow")
+            return
+        self._leave_raw(self._old_term)
+        print(clear_screen_raw(), end="", flush=True)
+        print(style(f"Log: {log_path}", "bright_cyan", bold=True))
+        print(style("─" * 60, "gray"))
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines_list = fh.readlines()
+        for line in lines_list[-40:]:
+            print(line.rstrip("\n"))
+        print()
+        print(style("按任意键返回...", "gray"))
+        import select
+
+        select.select([sys.stdin], [], [], 300)
+        self._old_term = self._enter_raw()
+
+    def _do_detail(self) -> None:
+        if not self._jobs or self._cursor >= len(self._jobs):
+            return
+        self._open_modal("detail", self._jobs[self._cursor])
+
+    # ── main loop ─────────────────────────────────────────────────
+
+    def run(self) -> None:
+        if not is_tty():
+            print(style("Dashboard 仅在交互终端可用，请使用子命令。", "yellow"))
+            return
+
+        self._old_term = self._enter_raw()
+        try:
+            # Enter alternate screen buffer (like top/less/vim)
+            sys.stdout.write(enter_alt_screen())
+            sys.stdout.write(clear_screen_raw())
+            sys.stdout.write(hide_cursor())
+            sys.stdout.flush()
+
+            self._reload()
+            last_refresh = 0.0
+            while not self._quit:
+                now_ts = time.time()
+                if now_ts - last_refresh >= self._refresh_interval:
+                    self._reload()
+                    last_refresh = now_ts
+
+                sys.stdout.write(clear_screen_raw() + self._render_body())
+                sys.stdout.flush()
+
+                # Read input with short timeout for responsiveness
+                key = self._read_key(timeout=0.08)
+                if key:
+                    if self._handle_key(key):
+                        break
+                    self._reload()
+                    last_refresh = time.time()
+        finally:
+            sys.stdout.write(leave_alt_screen())
+            sys.stdout.write(show_cursor())
+            sys.stdout.flush()
+            self._leave_raw(self._old_term)
+            print()
+
+    def _render_body(self) -> str:
+        """Render body content (without clear screen, for use with separate clear)."""
+        term_w = get_term_width(80)
+        term_h = os.get_terminal_size().lines if is_tty() else 40
+        out: list[str] = []
+
+        # Header — full terminal width
+        daemon_session = self._config.get("daemon_session_name", "gpuq-daemon")
+        daemon_running = screen_exists(daemon_session)
+        daemon_str = style("● running", "green") if daemon_running else style("○ stopped", "gray")
+        queue_label = f" [{self._filter_queue}]" if self._filter_queue else ""
+        title = f"GPU Queue{queue_label}"
+        inner_w = max(40, term_w - 2)
+        out.append(
+            style("╔" + "═" * inner_w + "╗", "bright_blue", bold=True)
+        )
+        left = f" {style(title, 'white', bold=True)}"
+        right = f"daemon: {daemon_str} "
+        pad = inner_w - _cell_width(left) - _cell_width(right) - 1
+        pad = max(1, pad)
+        out.append(
+            style("║", "bright_blue", bold=True)
+            + left
+            + " " * pad
+            + right
+            + style("║", "bright_blue", bold=True)
+        )
+        out.append(style("╚" + "═" * inner_w + "╝", "bright_blue", bold=True))
+        out.append("")
+
+        # GPU panel — compact, don't fill excess width
+        if self._metrics:
+            id_w = 3
+            name_w = 24
+            util_w = 18
+            mem_min = 16
+            gpu_w = id_w + name_w + util_w + mem_min + 11  # 11 = 3 separators + 2 borders
+            gpu_w = min(gpu_w, term_w - 2)
+            extra = max(0, term_w - 2 - gpu_w)
+            mem_w = mem_min + extra
+            gpu_rows = []
+            for gpu in self._metrics:
+                util = gpu["util"]
+                idx = str(gpu["index"])
+                mem_str = f"{gpu['mem_used']}/{gpu['mem_total']}"
+                gpu_rows.append([idx, gpu["name"], f"{render_gpu_bar(util)} {util}%", f"{mem_str} MB"])
+            b = BOX
+            sep_h = b["h"]
+            gpu_hdrs = ["GPU", "Name", "Util", "Memory"]
+            gpu_widths = [id_w, name_w, util_w, mem_w]
+            out.append(style("▸ GPU", "bright_blue", bold=True))
+            out.append(b["tl"] + b["mt"].join(sep_h * w for w in gpu_widths) + b["tr"])
+            out.append(b["v"] + b["v"].join(_pad(h, w) for h, w in zip(gpu_hdrs, gpu_widths)) + b["v"])
+            out.append(b["ml"] + b["x"].join(sep_h * w for w in gpu_widths) + b["mr"])
+            for gr in gpu_rows:
+                out.append(b["v"] + b["v"].join(_pad(c, w) for c, w in zip(gr, gpu_widths)) + b["v"])
+            out.append(b["bl"] + b["mb"].join(sep_h * w for w in gpu_widths) + b["br"])
+        out.append("")
+
+        # Job list
+        out.append(style("▸ Jobs", "bright_blue", bold=True))
+        out.append(f"  {render_summary_simple()}")
+        if self._filter_queue:
+            out.append(f"  filter: {style(self._filter_queue, queue_color(self._filter_queue))}  (f 切换)")
+        out.append("")
+
+        if self._jobs:
+            overhead = self._count_overhead(out) + 8
+            visible_h = max(4, term_h - overhead)
+            max_display = min(len(self._jobs), visible_h)
+            if self._scroll + max_display > len(self._jobs):
+                self._scroll = max(0, len(self._jobs) - max_display)
+            display_jobs = self._jobs[self._scroll : self._scroll + max_display]
+
+            id_w = max(2, max((len(str(j["id"])) for j in display_jobs), default=2)) + 1
+            p_w = 1
+            q_w = min(10, max((_cell_width(j.get("queue", "default")) for j in display_jobs), default=5))
+            st_w = max(6, max(
+                (_cell_width(f"{STATUS_STYLES.get(j['status'], {}).get('symbol', '?')} {STATUS_STYLES.get(j['status'], {}).get('label', j['status'])}")
+                 for j in display_jobs), default=6
+            ))
+            name_w = min(18, max((len(j["name"]) for j in display_jobs), default=4))
+            gpu_w = min(16, max((len(",".join(str(g) for g in j["gpus"])) for j in display_jobs), default=4))
+            fixed = id_w + p_w + q_w + st_w + name_w + gpu_w + 6 * 3
+            cmd_w = max(16, term_w - 2 - fixed)
+            widths = [id_w, p_w, q_w, st_w, name_w, gpu_w, cmd_w]
+            headers = ["ID", "P", "Queue", "Status", "Name", "GPUs", "Command"]
+
+            b = BOX
+            sep_h = b["h"]
+            out.append(b["tl"] + b["mt"].join(sep_h * w for w in widths) + b["tr"])
+            out.append(b["v"] + b["v"].join(_pad(h, w) for h, w in zip(headers, widths)) + b["v"])
+            out.append(b["ml"] + b["x"].join(sep_h * w for w in widths) + b["mr"])
+
+            for di, job in enumerate(display_jobs):
+                abs_idx = self._scroll + di
+                selected = abs_idx == self._cursor
+                prefix = "▶" if selected else " "
+                q = job.get("queue", "default")
+                sa = job.get("scheduled_after")
+                sched = ""
+                if sa:
+                    t = parse_time(sa)
+                    if t and t > now():
+                        sched = f" ⏳{t.strftime('%m-%d %H:%M')}"
+                        if _cell_width(sched) > cmd_w - 10:
+                            sched = ""
+                cmd_text = shorten(job["command"], cmd_w - len(sched) - 2)
+                if sched and "…" not in cmd_text:
+                    cmd_text = cmd_text + sched
+                cells: list[str] = [
+                    prefix + str(job["id"]),
+                    priority_symbol(int(job.get("priority", 0))),
+                    style(q, queue_color(q)),
+                    render_job_status(job["status"]),
+                    shorten(job["name"], name_w),
+                    ",".join(str(g) for g in job["gpus"]),
+                    cmd_text,
+                ]
+                row = b["v"] + b["v"].join(_pad(c, w) for c, w in zip(cells, widths)) + b["v"]
+                if selected:
+                    out.append(style(row, "white"))
+                else:
+                    out.append(row)
+            out.append(b["bl"] + b["mb"].join(sep_h * w for w in widths) + b["br"])
+            out.append(f"  {self._scroll + 1}-{self._scroll + len(display_jobs)} / {len(self._jobs)}")
+        else:
+            out.append(style("  (empty)", "gray", dim=True))
+
+        out.append("")
+
+        # Message
+        if self._message:
+            out.append(style(f"  {self._message}", "bright_yellow"))
+
+        # Status bar
+        sort_label = {"priority": "priority↓", "id": "id↑", "status": "status"}.get(self._sort_mode, self._sort_mode)
+        bar_w = min(term_w - 2, 120)
+        out.append(style("─" * bar_w, "gray"))
+        keys = [
+            "q:quit", "a:add", "c:cancel", "x:del", "r:retry",
+            "p:prio", "↑↓:nav", "Enter:detail", "l:logs",
+            "d:daemon", "f:filter", "s:sort", "?:help",
+        ]
+        key_line = "  ".join(keys)
+        if _cell_width(key_line) > term_w - 5:
+            key_line = "  ".join(keys[:8])
+        out.append(style(key_line, "gray") + f"   [{sort_label}]")
+        out.append("")
+
+        # Modal overlay
+        if self._modal:
+            out.extend(self._render_modal())
+
+        return "\r\n".join(out)
+
+    def _count_overhead(self, lines_before_jobs: list[str]) -> int:
+        return len(lines_before_jobs)
+
+
+
+def render_summary_simple() -> str:
+    try:
+        with state_lock(timeout=0.5):
+            state = load_state()
+        return render_summary(state)
+    except CliError:
+        return "(状态文件忙)"
+
+
+def fallback_add_form(config: dict[str, Any], metrics: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
+    """Simple line-by-line prompt fallback when TTY is not available."""
+    next_job_id = 1
+    try:
+        with state_lock():
+            state = load_state()
+            next_job_id = state["next_job_id"]
+    except Exception:
+        pass
+    default_gpus = resolve_default_gpus(config, metrics)
+    result: dict[str, Any] = {}
+    result["cwd"] = args.cwd or prompt("运行目录", str(BASE_DIR))
+    result["command"] = args.command or prompt("运行命令", allow_empty=False)
+    result["name"] = args.name or prompt("任务名", derive_name(result["command"], next_job_id))
+    gpu_text = args.gpus
+    if gpu_text is None:
+        gpu_text = prompt(
+            "GPU 列表，逗号分隔，留空表示全部",
+            ",".join(str(g) for g in default_gpus) if default_gpus else "all",
+            allow_empty=True,
+        )
+    result["gpus"] = parse_gpu_list(gpu_text, default_gpus)
+    result["queue"] = args.queue or prompt("队列名", config.get("default_queue", "default"), allow_empty=True) or "default"
+    result["priority"] = args.priority if args.priority is not None else int(prompt("优先级", "0", allow_empty=True) or "0")
+    result["conda_env"] = args.conda_env or prompt("Conda 环境（留空跳过）", "", allow_empty=True)
+    schedule_raw = args.schedule_at or prompt("定时启动 (留空=立即, +2h, 2026-05-01 08:00)", "", allow_empty=True)
+    result["scheduled_after"] = parse_schedule(schedule_raw) if schedule_raw else None
+    return result
+
+
+def parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise CliError(f"无法解析布尔值: {value}")
+
+
+def parse_gpu_list(raw: str | None, discovered: list[int] | None = None) -> list[int]:
+    if raw is None:
+        return discovered or []
+    text = raw.strip().lower()
+    if not text or text == "all":
+        return discovered or []
+    result = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            result.append(int(value))
+        except ValueError as exc:
+            raise CliError(f"GPU 列表格式错误: {raw}") from exc
+    if not result:
+        raise CliError("GPU 列表不能为空。")
+    return sorted(dict.fromkeys(result))
+
+
+def load_gpu_metrics() -> list[dict[str, Any]]:
+    require_binary("nvidia-smi")
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    proc = run_command(cmd)
+    metrics: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [item.strip() for item in line.split(",")]
+        if len(parts) != 5:
+            continue
+        metrics.append(
+            {
+                "index": int(parts[0]),
+                "name": parts[1],
+                "util": int(parts[2]),
+                "mem_used": int(parts[3]),
+                "mem_total": int(parts[4]),
+            }
+        )
+    if not metrics:
+        raise CliError("没有拿到 GPU 信息，请检查 nvidia-smi 输出。")
+    return metrics
+
+
+def gpu_index_list(metrics: list[dict[str, Any]]) -> list[int]:
+    return [item["index"] for item in metrics]
+
+
+def screen_sessions() -> list[str]:
+    require_binary("screen")
+    proc = run_command(["screen", "-ls"], check=False)
+    sessions = []
+    for line in proc.stdout.splitlines():
+        match = re.search(r"\s+\d+\.([^\s]+)\s+\(", line)
+        if match:
+            sessions.append(match.group(1))
+    return sessions
+
+
+def screen_exists(session_name: str) -> bool:
+    return session_name in screen_sessions()
+
+
+def _cell_width(text: str) -> int:
+    stripped = re.sub(r"\033\[[0-9;]*m", "", text)
+    return len(stripped)
+
+
+def _pad(text: str, width: int) -> str:
+    need = max(0, width - _cell_width(text))
+    return text + " " * need
+
+
+def table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [max(_cell_width(h), max((_cell_width(c) for c in col), default=0)) for h, col in zip(headers, zip(*rows))] if rows else [_cell_width(h) for h in headers]
+    if not widths:
+        return ""
+    sep_h = BOX["h"]
+    sep_v = BOX["v"]
+    tl, tr, bl, br = BOX["tl"], BOX["tr"], BOX["bl"], BOX["br"]
+    ml, mr, mt, mb, x = BOX["ml"], BOX["mr"], BOX["mt"], BOX["mb"], BOX["x"]
+
+    def _row(cells: list[str], left: str, mid: str, right: str, pad_char: str = " ") -> str:
+        padded = [_pad(c, w) if pad_char == " " else pad_char * w for c, w in zip(cells, widths)]
+        return left + mid.join(padded) + right
+
+    top = _row([sep_h * w for w in widths], tl, mt, tr)
+    hdr = _row(headers, sep_v, sep_v, sep_v)
+    div = _row([sep_h * w for w in widths], ml, x, mr)
+    bot = _row([sep_h * w for w in widths], bl, mb, br)
+
+    lines = [top, hdr, div]
+    for row in rows:
+        lines.append(_row(row, sep_v, sep_v, sep_v))
+    lines.append(bot)
+    return "\n".join(lines)
+
+
+def job_sort_key(job: dict[str, Any]) -> tuple[int, int]:
+    return (-int(job.get("priority", 0)), int(job["id"]))
+
+
+def first_job(state: dict[str, Any], status: str, queue: str | None = None) -> dict[str, Any] | None:
+    candidates = [
+        job
+        for job in sorted(state["jobs"], key=job_sort_key)
+        if job["status"] == status
+        and (queue is None or job.get("queue", "default") == queue)
+    ]
+    for job in candidates:
+        scheduled = job.get("scheduled_after")
+        if scheduled:
+            sa = parse_time(scheduled)
+            if sa and sa > now():
+                continue
+        return job
+    return None
+
+
+def find_job(state: dict[str, Any], job_id: int) -> dict[str, Any]:
+    for job in state["jobs"]:
+        if job["id"] == job_id:
+            return job
+    raise CliError(f"找不到任务 {job_id}")
+
+
+def prune_history(state: dict[str, Any], limit: int) -> None:
+    finished = [job for job in state["jobs"] if job["status"] in {"completed", "failed", "canceled"}]
+    finished.sort(key=lambda item: item["id"])
+    overflow = max(0, len(finished) - limit)
+    if overflow <= 0:
+        return
+    delete_ids = {job["id"] for job in finished[:overflow]}
+    state["jobs"] = [job for job in state["jobs"] if job["id"] not in delete_ids]
+
+
+def resolve_default_gpus(config: dict[str, Any], metrics: list[dict[str, Any]]) -> list[int]:
+    return parse_gpu_list(config.get("default_gpus", ""), gpu_index_list(metrics))
+
+
+def create_job(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    name: str,
+    cwd: str,
+    command: str,
+    gpus: list[int],
+    queue: str | None,
+    priority: int | None,
+    scheduled_after: str | None,
+    conda_env: str | None,
+    launch_hold_s: int | None,
+    idle_util_threshold: int | None,
+    idle_mem_threshold_mb: int | None,
+    idle_streak_required: int | None,
+    set_cuda_visible_devices: bool | None,
+) -> dict[str, Any]:
+    job_id = state["next_job_id"]
+    state["next_job_id"] += 1
+    job = {
+        "id": job_id,
+        "name": name,
+        "queue": queue if queue is not None else str(config.get("default_queue", "default")),
+        "priority": int(priority if priority is not None else config.get("default_priority", 0)),
+        "scheduled_after": scheduled_after,
+        "conda_env": conda_env if conda_env is not None else str(config.get("default_conda_env", "")),
+        "cwd": str(Path(cwd).expanduser().resolve()),
+        "command": command,
+        "gpus": gpus,
+        "status": "queued",
+        "created_at": now_iso(),
+        "started_at": None,
+        "finished_at": None,
+        "screen_session": None,
+        "run_dir": None,
+        "log_path": None,
+        "exit_code": None,
+        "launch_hold_s": int(launch_hold_s if launch_hold_s is not None else config["launch_hold_s"]),
+        "idle_util_threshold": int(
+            idle_util_threshold if idle_util_threshold is not None else config["idle_util_threshold"]
+        ),
+        "idle_mem_threshold_mb": int(
+            idle_mem_threshold_mb if idle_mem_threshold_mb is not None else config["idle_mem_threshold_mb"]
+        ),
+        "idle_streak_required": int(
+            idle_streak_required if idle_streak_required is not None else config["idle_streak_required"]
+        ),
+        "set_cuda_visible_devices": (
+            set_cuda_visible_devices
+            if set_cuda_visible_devices is not None
+            else bool(config["set_cuda_visible_devices"])
+        ),
+        "notes": [],
+    }
+    state["jobs"].append(job)
+    return job
+
+
+def derive_name(command: str, job_id: int | None = None) -> str:
+    token = shlex.split(command)[0] if command.strip() else "job"
+    stem = Path(token).name or "job"
+    return stem if job_id is None else f"{stem}-{job_id}"
+
+
+def render_job_status(status: str) -> str:
+    st = STATUS_STYLES.get(status, {"color": "gray", "symbol": "?", "label": status})
+    return f"{st['symbol']} {style(st['label'], st['color'], bold=status == 'running')}"
+
+
+def priority_symbol(priority: int) -> str:
+    if priority >= 10:
+        return style("▲", "bright_red")
+    if priority >= 5:
+        return style("▲", "bright_yellow")
+    if priority >= 1:
+        return style("▲", "bright_cyan")
+    if priority <= -10:
+        return style("▼", "gray", dim=True)
+    if priority <= -5:
+        return style("▼", "gray", dim=True)
+    return style("─", "gray", dim=True)
+
+
+def render_gpu_bar(util: int, width: int = 10) -> str:
+    filled = min(width, max(0, round(util / 100 * width)))
+    empty = width - filled
+    if util >= 80:
+        color = "red"
+    elif util >= 50:
+        color = "yellow"
+    elif util >= 10:
+        color = "green"
+    else:
+        color = "gray"
+    bar = "█" * filled + "░" * empty
+    return style(f"[{bar}]", color)
+
+
+def queue_color(queue_name: str) -> str:
+    h = hash(queue_name) % len(QUEUE_COLORS)
+    return QUEUE_COLORS[abs(h)]
+
+
+def render_summary(state: dict[str, Any]) -> str:
+    counts: dict[str, int] = {}
+    for job in state["jobs"]:
+        s = job["status"]
+        counts[s] = counts.get(s, 0) + 1
+    parts = []
+    total = len(state["jobs"])
+    parts.append(f"total {total}")
+    for status, st in STATUS_STYLES.items():
+        if status in counts:
+            parts.append(f"{st['symbol']} {counts[status]} {st['label']}")
+    return "  ".join(parts)
+
+
+def gpu_idle_reason(job: dict[str, Any], metrics: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+    wanted = set(job["gpus"])
+    available = {item["index"]: item for item in metrics}
+    reasons = []
+    for gpu_id in job["gpus"]:
+        if gpu_id not in available:
+            reasons.append(f"GPU {gpu_id} 不存在")
+            continue
+        gpu = available[gpu_id]
+        if gpu["util"] > job["idle_util_threshold"]:
+            reasons.append(f"GPU {gpu_id} util={gpu['util']}%")
+        if gpu["mem_used"] > job["idle_mem_threshold_mb"]:
+            reasons.append(f"GPU {gpu_id} mem={gpu['mem_used']}MB")
+    missing = wanted - set(available)
+    for gpu_id in sorted(missing):
+        reasons.append(f"GPU {gpu_id} 缺失")
+    return (len(reasons) == 0, reasons)
+
+
+def run_metadata_paths(job_id: int) -> tuple[Path, Path, Path]:
+    stamp = now().strftime("%Y%m%d-%H%M%S")
+    run_dir = RUN_DIR / f"job-{job_id}-{stamp}"
+    log_path = run_dir / "job.log"
+    exit_path = run_dir / "exit_code.txt"
+    return run_dir, log_path, exit_path
+
+
+def build_wrapper_script(job: dict[str, Any], run_dir: Path, log_path: Path, exit_path: Path) -> Path:
+    script_path = run_dir / "launch.sh"
+    exports = ""
+    if job["set_cuda_visible_devices"]:
+        exports = f"export CUDA_VISIBLE_DEVICES={shlex.quote(','.join(str(g) for g in job['gpus']))}\n"
+    # Always source conda.sh so conda activate works in non-interactive shell
+    conda_init = (
+        'CONDA_BASE=$(conda info --base 2>/dev/null)\n'
+        'if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then\n'
+        '  source "$CONDA_BASE/etc/profile.d/conda.sh"\n'
+        'fi\n'
+    )
+    conda_activate = ""
+    echo_env = ""
+    if job.get("conda_env"):
+        conda_env_name = shlex.quote(job["conda_env"])
+        conda_activate = f"conda activate {conda_env_name}\n"
+        echo_env = f"\\necho '[gpuq] conda_env: {conda_env_name}' >> \"$LOG_FILE\""
+    content = textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        set -u
+        LOG_FILE={shlex.quote(str(log_path))}
+        EXIT_FILE={shlex.quote(str(exit_path))}
+        {{
+          echo "[gpuq] started_at: $(date '+%F %T %z')"
+          echo "[gpuq] job_id: {job['id']}"
+          echo "[gpuq] cwd: {job['cwd']}"
+          echo "[gpuq] gpus: {','.join(str(g) for g in job['gpus'])}"
+          echo "[gpuq] command: {job['command']}"{echo_env}
+        }} >> "$LOG_FILE"
+
+        if ! cd {shlex.quote(job['cwd'])}; then
+          rc=$?
+          echo "[gpuq] cd failed: {job['cwd']}" >> "$LOG_FILE"
+          printf '%s\\n' "$rc" > "$EXIT_FILE"
+          exit "$rc"
+        fi
+
+        {conda_init}{conda_activate}{exports}bash -lc {shlex.quote(job['command'])} >> "$LOG_FILE" 2>&1
+        rc=$?
+        echo "[gpuq] finished_at: $(date '+%F %T %z')" >> "$LOG_FILE"
+        echo "[gpuq] exit_code: $rc" >> "$LOG_FILE"
+        printf '%s\\n' "$rc" > "$EXIT_FILE"
+        exit "$rc"
+        """
+    )
+    script_path.write_text(content, encoding="utf-8")
+    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
+    return script_path
+
+
+def launch_job(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, Path]:
+    run_dir, log_path, exit_path = run_metadata_paths(job["id"])
+    run_dir.mkdir(parents=True, exist_ok=False)
+    wrapper = build_wrapper_script(job, run_dir, log_path, exit_path)
+    session = f"{config['screen_prefix']}-{job['id']}-{slugify(job['name'])[:24]}"
+    proc = run_command(["screen", "-dmS", session, config["shell"], str(wrapper)], check=False)
+    if proc.returncode != 0:
+        raise CliError(f"screen 启动失败: {proc.stderr.strip()}")
+    job["status"] = "running"
+    job["started_at"] = now_iso()
+    job["finished_at"] = None
+    job["screen_session"] = session
+    job["run_dir"] = str(run_dir)
+    job["log_path"] = str(log_path)
+    job["exit_code"] = None
+    job["hold_until"] = (now() + dt.timedelta(seconds=job["launch_hold_s"])).replace(microsecond=0).isoformat()
+    time.sleep(1)
+    if not screen_exists(session):
+        job["status"] = "failed"
+        job["finished_at"] = now_iso()
+        job["exit_code"] = -1
+        raise CliError(f"任务 {job['id']} 的 screen 会话未成功建立。")
+    return session, log_path
+
+
+def finish_running_job(job: dict[str, Any]) -> None:
+    exit_code = None
+    if job.get("run_dir"):
+        exit_path = Path(job["run_dir"]) / "exit_code.txt"
+        if exit_path.exists():
+            try:
+                exit_code = int(exit_path.read_text(encoding="utf-8").strip())
+            except ValueError:
+                exit_code = -1
+    job["exit_code"] = exit_code
+    job["finished_at"] = now_iso()
+    job["hold_until"] = None
+    job["status"] = "completed" if exit_code == 0 else "failed"
+
+
+def daemon_log_path() -> Path:
+    return LOG_DIR / "daemon.log"
+
+
+def render_gpu_table(metrics: list[dict[str, Any]], gpu_filter: set[int] | None = None) -> str:
+    rows = []
+    for gpu in metrics:
+        util = gpu["util"]
+        idx = str(gpu["index"])
+        mark = ""
+        if gpu_filter and gpu["index"] in gpu_filter:
+            mark = " ◀"
+            idx = style(idx, "bright_cyan", bold=True)
+        rows.append(
+            [
+                idx,
+                gpu["name"],
+                f"{render_gpu_bar(util)} {util}%",
+                f"{gpu['mem_used']} / {gpu['mem_total']} MB",
+            ]
+        )
+    return table(["GPU", "Name", "Util", "Memory"], rows)
+
+
+def render_jobs(state: dict[str, Any], *, include_done: bool = False, queue: str | None = None) -> str:
+    jobs = sorted(state["jobs"], key=job_sort_key)
+    if queue is not None:
+        jobs = [job for job in jobs if job.get("queue", "default") == queue]
+    if not include_done:
+        jobs = [job for job in jobs if job["status"] in {"queued", "running"}]
+    if not jobs:
+        return table(["ID", "P", "Queue", "Status", "Name", "GPUs", "Command"], [])
+
+    term_w = get_term_width(120)
+    rows = []
+    for job in jobs:
+        q = job.get("queue", "default")
+        scheduled_info = ""
+        sa = job.get("scheduled_after")
+        if sa:
+            t = parse_time(sa)
+            if t and t > now():
+                scheduled_info = f" ⏳{t.strftime('%m-%d %H:%M')}"
+        rows.append(
+            [
+                str(job["id"]),
+                priority_symbol(int(job.get("priority", 0))),
+                q,
+                f"{STATUS_STYLES.get(job['status'], {}).get('symbol', '?')} {STATUS_STYLES.get(job['status'], {}).get('label', job['status'])}",
+                job["name"],
+                ",".join(str(gpu) for gpu in job["gpus"]),
+                shorten(job["command"], 80) + scheduled_info,
+            ]
+        )
+
+    col_sep = 3
+    fixed_cols = 6  # ID, P, Queue, Status, Name, GPUs
+    id_w = max(2, max((len(r[0]) for r in rows), default=2))
+    p_w = 1
+    q_w = min(12, max((_cell_width(r[2]) for r in rows), default=5))
+    st_w = max(6, max((_cell_width(r[3]) for r in rows), default=6))
+    name_w = min(24, max((len(r[4]) for r in rows), default=4))
+    gpu_w = min(20, max((len(r[5]) for r in rows), default=4))
+    fixed_total = id_w + p_w + q_w + st_w + name_w + gpu_w + col_sep * fixed_cols + 2
+    cmd_w = max(20, term_w - fixed_total)
+    headers = ["ID", "P", "Queue", "Status", "Name", "GPUs", "Command"]
+    widths = [id_w, p_w, q_w, st_w, name_w, gpu_w, cmd_w]
+
+    styled_rows = []
+    for i, r in enumerate(rows):
+        cmd_text = shorten(r[6], cmd_w)
+        j = jobs[i]
+        styled_rows.append(
+            [
+                r[0],
+                r[1],
+                style(r[2], queue_color(r[2])),
+                render_job_status(j["status"]),
+                shorten(r[4], name_w),
+                r[5],
+                cmd_text,
+            ]
+        )
+
+    # Build table manually to respect widths
+    b = BOX
+    sep_h, sep_v = b["h"], b["v"]
+    tl, tr, bl, br = b["tl"], b["tr"], b["bl"], b["br"]
+    ml, mr, mt, mb, x = b["ml"], b["mr"], b["mt"], b["mb"], b["x"]
+
+    def _row(cells, left, mid, right, pad_char=" "):
+        padded = [_pad(c, w) if pad_char == " " else pad_char * w for c, w in zip(cells, widths)]
+        return left + mid.join(padded) + right
+
+    lines = [
+        _row([sep_h * w for w in widths], tl, mt, tr),
+        _row(headers, sep_v, sep_v, sep_v),
+        _row([sep_h * w for w in widths], ml, x, mr),
+    ]
+    for sr in styled_rows:
+        lines.append(_row(sr, sep_v, sep_v, sep_v))
+    lines.append(_row([sep_h * w for w in widths], bl, mb, br))
+    return "\n".join(lines)
+
+
+def render_job_detail(job: dict[str, Any]) -> str:
+    q = job.get("queue", "default")
+    p = job.get("priority", 0)
+    sa = job.get("scheduled_after")
+    sa_display = format_time(sa) if sa else "立即"
+    ce = job.get("conda_env", "")
+    lines = [
+        f"ID:       {job['id']}",
+        f"Name:     {job['name']}",
+        f"Status:   {render_job_status(job['status'])}",
+        f"Queue:    {style(q, queue_color(q))}",
+        f"Priority: {priority_symbol(p)} {p}",
+        f"Schedule: {sa_display}",
+        f"Conda:    {ce if ce else '-'}",
+        f"CWD:      {job['cwd']}",
+        f"Command:  {job['command']}",
+        f"GPUs:     {','.join(str(g) for g in job['gpus'])}",
+        f"Created:  {format_time(job.get('created_at'))}",
+        f"Started:  {format_time(job.get('started_at'))}",
+        f"Finished: {format_time(job.get('finished_at'))}",
+        f"Launch hold: {job.get('launch_hold_s')}s",
+        f"Screen:   {job.get('screen_session') or '-'}",
+        f"Log:      {job.get('log_path') or '-'}",
+        f"Exit code: {job.get('exit_code') if job.get('exit_code') is not None else '-'}",
+    ]
+    return "\n".join(lines)
+
+
+def print_status(include_done: bool = True) -> None:
+    with state_lock():
+        state = load_state()
+        config = load_config()
+    metrics = load_gpu_metrics()
+    daemon_session = config["daemon_session_name"]
+    daemon_state = "running" if screen_exists(daemon_session) else "stopped"
+    running_job = first_job(state, "running")
+    gpu_filter = set(running_job["gpus"]) if running_job else None
+    print(banner("GPU 状态"))
+    print(render_gpu_table(metrics, gpu_filter=gpu_filter))
+    print()
+    print(banner("守护进程"))
+    print(f"session: {daemon_session}")
+    print(f"status: {daemon_state}")
+    print(f"log: {daemon_log_path()}")
+    print()
+    print(banner("队列概览"))
+    print(render_summary(state))
+    print()
+    print(banner("队列"))
+    print(render_jobs(state, include_done=include_done))
+
+
+def cmd_init(_: argparse.Namespace) -> int:
+    ensure_layout()
+    print(f"初始化完成: {BASE_DIR}")
+    print(f"配置文件: {CONFIG_FILE}")
+    print(f"状态文件: {STATE_FILE}")
+    return 0
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    ensure_layout()
+    print(banner("依赖检查"))
+    for name in ("python3", "screen", "nvidia-smi"):
+        path = shutil.which(name)
+        status = style("OK", "green", bold=True) if path else style("MISSING", "red", bold=True)
+        print(f"{name:<12} {status}  {path or '-'}")
+    print()
+    print(banner("路径"))
+    print(f"base:   {BASE_DIR}")
+    print(f"config: {CONFIG_FILE}")
+    print(f"state:  {STATE_FILE}")
+    print(f"logs:   {LOG_DIR}")
+    print(f"runs:   {RUN_DIR}")
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    ensure_layout()
+    metrics = load_gpu_metrics()
+    with state_lock():
+        config = load_config()
+        state = load_state()
+        next_job_id = state["next_job_id"]
+        default_gpus = resolve_default_gpus(config, metrics)
+
+    has_cli_overrides = any(
+        getattr(args, a, None) is not None
+        for a in ("name", "command", "cwd", "gpus", "queue", "priority", "schedule_at", "conda_env")
+    )
+
+    form_defaults: dict[str, Any] = {
+        "name": args.name or "",
+        "command": args.command or "",
+        "cwd": args.cwd or "",
+        "gpus": args.gpus or "",
+        "queue": args.queue or config.get("default_queue", "default"),
+        "priority": args.priority if args.priority is not None else config.get("default_priority", 0),
+        "schedule": "",
+        "conda_env": args.conda_env or config.get("default_conda_env", ""),
+        "launch_hold_s": str(args.launch_hold_s) if args.launch_hold_s else "",
+    }
+
+    if args.schedule_at:
+        form_defaults["schedule"] = args.schedule_at
+
+    form_data: dict[str, Any] | None = None
+
+    if not has_cli_overrides:
+        form = InteractiveForm(form_defaults, metrics)
+        form_data = form.run()
+
+    if form_data is None:
+        if has_cli_overrides:
+            form_data = {}
+        else:
+            form_data = fallback_add_form(config, metrics, args)
+
+    name = form_data.get("name") or args.name or prompt("任务名", derive_name(form_data.get("command", "cmd"), next_job_id))
+    command = form_data.get("command") or args.command or prompt("运行命令", allow_empty=False)
+    cwd = form_data.get("cwd") or args.cwd or prompt("运行目录", str(BASE_DIR))
+    gpu_text = form_data.get("gpus") or args.gpus
+    if gpu_text is None:
+        gpu_text = prompt(
+            "GPU 列表，逗号分隔，留空表示全部",
+            ",".join(str(g) for g in default_gpus) if default_gpus else "all",
+            allow_empty=True,
+        )
+    gpus = parse_gpu_list(gpu_text, default_gpus)
+    queue = (form_data.get("queue") if form_data and form_data.get("queue") else None) or args.queue or config.get("default_queue", "default")
+    priority_raw = form_data.get("priority", "") if form_data else ""
+    if priority_raw and str(priority_raw).strip():
+        priority_val = int(priority_raw)
+    elif args.priority is not None:
+        priority_val = args.priority
+    else:
+        priority_val = int(config.get("default_priority", 0))
+    schedule_raw = (form_data.get("schedule", "") if form_data else "") or args.schedule_at or ""
+    scheduled_after = parse_schedule(schedule_raw) if schedule_raw else None
+
+    with state_lock():
+        state = load_state()
+        config = load_config()
+        conda_env = (form_data.get("conda_env") if form_data and form_data.get("conda_env") else None) or args.conda_env or ""
+        job = create_job(
+            state,
+            config,
+            name=name,
+            cwd=cwd,
+            command=command,
+            gpus=gpus,
+            queue=queue,
+            priority=priority_val,
+            scheduled_after=scheduled_after,
+            conda_env=conda_env if conda_env else None,
+            launch_hold_s=args.launch_hold_s,
+            idle_util_threshold=args.idle_util_threshold,
+            idle_mem_threshold_mb=args.idle_mem_threshold_mb,
+            idle_streak_required=args.idle_streak_required,
+            set_cuda_visible_devices=args.set_cuda_visible_devices,
+        )
+        save_state(state)
+    print(style(f"已加入队列: job {job['id']}", "green", bold=True))
+    print(render_job_detail(job))
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+    print(banner("队列"))
+    print(render_summary(state))
+    print()
+    print(render_jobs(state, include_done=args.all, queue=args.queue))
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+        job = find_job(state, args.job_id)
+    print(render_job_detail(job))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    print_status(include_done=args.all)
+    return 0
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+        job = find_job(state, args.job_id)
+        if job["status"] == "running":
+            raise CliError("运行中的任务不能 remove，请先让它结束，或用 screen 手动停止。")
+        if job["status"] not in {"queued", "failed", "completed", "canceled"}:
+            raise CliError(f"当前状态不能 remove: {job['status']}")
+        state["jobs"] = [item for item in state["jobs"] if item["id"] != args.job_id]
+        save_state(state)
+    print(f"已删除任务 {args.job_id}")
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+        job = find_job(state, args.job_id)
+        if job["status"] == "running":
+            if not args.force:
+                raise CliError("运行中的任务需要加 --force 才会终止对应 screen。")
+            session = job.get("screen_session")
+            if session and screen_exists(session):
+                run_command(["screen", "-S", session, "-X", "quit"], check=False)
+            job["status"] = "canceled"
+            job["finished_at"] = now_iso()
+            job["hold_until"] = None
+            job["exit_code"] = -15
+        elif job["status"] == "queued":
+            job["status"] = "canceled"
+            job["finished_at"] = now_iso()
+        else:
+            raise CliError(f"当前状态不能 cancel: {job['status']}")
+        save_state(state)
+    print(f"已取消任务 {args.job_id}")
+    return 0
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+        job = find_job(state, args.job_id)
+        if job["status"] not in {"failed", "completed", "canceled"}:
+            raise CliError(f"当前状态不能 retry: {job['status']}")
+        job["status"] = "queued"
+        job["started_at"] = None
+        job["finished_at"] = None
+        job["screen_session"] = None
+        job["run_dir"] = None
+        job["log_path"] = None
+        job["exit_code"] = None
+        job["hold_until"] = None
+        job["scheduled_after"] = None
+        job.setdefault("queue", "default")
+        job.setdefault("priority", 0)
+        save_state(state)
+    print(f"已重新排队任务 {args.job_id}")
+    return 0
+
+
+def cmd_prioritize(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+        job = find_job(state, args.job_id)
+        if job["status"] not in {"queued", "running", "failed", "completed", "canceled"}:
+            raise CliError(f"当前状态不能修改优先级: {job['status']}")
+        old = job.get("priority", 0)
+        job["priority"] = args.priority
+        save_state(state)
+    print(f"任务 {args.job_id} 优先级: {old} → {args.priority}")
+    return 0
+
+
+def cmd_queues(_: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+    queues: dict[str, dict[str, int]] = {}
+    for job in state["jobs"]:
+        q = job.get("queue", "default")
+        if q not in queues:
+            queues[q] = {"total": 0, "queued": 0, "running": 0, "completed": 0, "failed": 0, "canceled": 0}
+        queues[q]["total"] += 1
+        st = job["status"]
+        if st in queues[q]:
+            queues[q][st] += 1
+    if not queues:
+        print("还没有任何队列。")
+        return 0
+    rows = []
+    for qname in sorted(queues):
+        qd = queues[qname]
+        rows.append(
+            [
+                style(qname, queue_color(qname), bold=True),
+                str(qd["total"]),
+                f"{STATUS_STYLES['queued']['symbol']} {qd['queued']}",
+                f"{STATUS_STYLES['running']['symbol']} {qd['running']}",
+                f"{STATUS_STYLES['completed']['symbol']} {qd['completed']}",
+                f"{STATUS_STYLES['failed']['symbol']} {qd['failed']}",
+            ]
+        )
+    print(banner("队列概览"))
+    print(table(["Queue", "Total", "Queued", "Running", "Done", "Failed"], rows))
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = load_state()
+        job = find_job(state, args.job_id)
+    if not job.get("log_path"):
+        raise CliError("这个任务还没有日志文件。")
+    log_path = Path(job["log_path"])
+    if not log_path.exists():
+        raise CliError(f"日志文件不存在: {log_path}")
+    print(f"log: {log_path}")
+    with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    for line in lines[-args.lines :]:
+        print(line.rstrip("\n"))
+    return 0
+
+
+class SchedulerRuntime:
+    def __init__(self, target_queue: str | None = None) -> None:
+        self.head_job_id: int | None = None
+        self.idle_streak = 0
+        self.last_message = ""
+        self.target_queue = target_queue
+
+    def update_idle_streak(self, job_id: int, idle: bool) -> int:
+        if self.head_job_id != job_id:
+            self.head_job_id = job_id
+            self.idle_streak = 0
+        if idle:
+            self.idle_streak += 1
+        else:
+            self.idle_streak = 0
+        return self.idle_streak
+
+
+def scheduler_tick(runtime: SchedulerRuntime) -> dict[str, Any]:
+    metrics = load_gpu_metrics()
+    snapshot: dict[str, Any] = {
+        "metrics": metrics,
+        "event": "",
+        "idle_reasons": [],
+        "running_job": None,
+        "head_job": None,
+        "idle_streak": runtime.idle_streak,
+        "target_queue": runtime.target_queue,
+    }
+
+    with state_lock():
+        state = load_state()
+        config = load_config()
+        running_job = first_job(state, "running", queue=runtime.target_queue)
+        snapshot["state"] = state
+        snapshot["config"] = config
+        if running_job:
+            snapshot["running_job"] = json.loads(json.dumps(running_job))
+            session = running_job.get("screen_session")
+            if session and not screen_exists(session):
+                finish_running_job(running_job)
+                prune_history(state, int(config["history_limit"]))
+                save_state(state)
+                snapshot["event"] = f"任务 {running_job['id']} 已结束，退出码 {running_job['exit_code']}"
+                snapshot["running_job"] = None
+                running_job = None
+        if not running_job:
+            head = first_job(state, "queued", queue=runtime.target_queue)
+            if head:
+                snapshot["head_job"] = json.loads(json.dumps(head))
+                idle, reasons = gpu_idle_reason(head, metrics)
+                streak = runtime.update_idle_streak(head["id"], idle)
+                snapshot["idle_streak"] = streak
+                snapshot["idle_reasons"] = reasons
+                if idle and streak >= int(head["idle_streak_required"]):
+                    try:
+                        session, log_path = launch_job(head, config)
+                        save_state(state)
+                        snapshot["event"] = f"任务 {head['id']} 已启动，screen={session}，log={log_path}"
+                        snapshot["running_job"] = json.loads(json.dumps(head))
+                        snapshot["head_job"] = None
+                        runtime.idle_streak = 0
+                    except Exception as exc:
+                        head["status"] = "failed"
+                        head["finished_at"] = now_iso()
+                        head["exit_code"] = -1
+                        head["notes"].append(str(exc))
+                        save_state(state)
+                        snapshot["event"] = f"任务 {head['id']} 启动失败: {exc}"
+            else:
+                runtime.head_job_id = None
+                runtime.idle_streak = 0
+    return snapshot
+
+
+def render_snapshot(snapshot: dict[str, Any]) -> str:
+    state = snapshot["state"]
+    running_job = snapshot["running_job"]
+    head_job = snapshot["head_job"]
+    target_queue = snapshot.get("target_queue")
+    queue_label = f" [{target_queue}]" if target_queue else ""
+
+    gpu_filter = set(running_job["gpus"]) if running_job else (set(head_job["gpus"]) if head_job else None)
+
+    lines = [
+        banner("╔══════════════════════════════════════╗"),
+        banner("║      GPU Queue Dashboard" + queue_label.ljust(21) + "║"),
+        banner("╚══════════════════════════════════════╝"),
+        f"  更新时间: {format_time(now_iso())}",
+        "",
+        banner("▸ GPU 状态"),
+        render_gpu_table(snapshot["metrics"], gpu_filter=gpu_filter),
+        "",
+        banner("▸ 任务概览"),
+        render_summary(state),
+        "",
+        banner("▸ 运行中"),
+    ]
+    if running_job:
+        hold_until = parse_time(running_job.get("hold_until"))
+        hold_info = "-"
+        if hold_until:
+            remain = (hold_until - now()).total_seconds()
+            hold_info = format_duration(remain) if remain > 0 else "0s"
+        lines.extend(
+            [
+                f"   job {running_job['id']}  {style(running_job['name'], 'bright_green', bold=True)}",
+                f"   queue: {style(running_job.get('queue', 'default'), queue_color(running_job.get('queue', 'default')))}",
+                f"   screen: {running_job.get('screen_session') or '-'}",
+                f"   log: {running_job.get('log_path') or '-'}",
+                f"   hold: {hold_info}",
+            ]
+        )
+    else:
+        lines.append("   当前没有运行中的任务。")
+    lines.extend(["", banner("▸ 队首候选")])
+    if head_job:
+        sa = head_job.get("scheduled_after")
+        sa_info = ""
+        if sa:
+            t = parse_time(sa)
+            if t and t > now():
+                remain = (t - now()).total_seconds()
+                sa_info = f"  ⏳ 等待至 {format_time(sa)} (剩余 {format_duration(remain)})"
+        lines.extend(
+            [
+                f"   job {head_job['id']}  {style(head_job['name'], 'bright_yellow', bold=True)}",
+                f"   queue: {style(head_job.get('queue', 'default'), queue_color(head_job.get('queue', 'default')))}  priority: {head_job.get('priority', 0)}{sa_info}",
+                f"   gpus: {','.join(str(g) for g in head_job['gpus'])}",
+                f"   idle streak: {snapshot['idle_streak']} / {head_job['idle_streak_required']}",
+            ]
+        )
+        if snapshot["idle_reasons"]:
+            lines.append("   busy: " + style("; ".join(snapshot["idle_reasons"]), "red"))
+        else:
+            lines.append("   busy: " + style("GPU 空闲，等待 streak 满足后启动", "green"))
+    else:
+        lines.append("   当前没有排队任务。")
+    lines.extend(
+        [
+            "",
+            banner("▸ 队列"),
+            render_jobs(state, include_done=False),
+        ]
+    )
+    if snapshot["event"]:
+        lines.extend(["", banner("▸ 事件"), f"   {snapshot['event']}"])
+    return "\n".join(lines)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    ensure_layout()
+    runtime = SchedulerRuntime(target_queue=args.queue)
+    with state_lock():
+        config = load_config()
+    poll_interval = int(args.poll_interval or config["poll_interval_s"])
+    try:
+        while True:
+            snapshot = scheduler_tick(runtime)
+            if args.quiet:
+                if snapshot["event"]:
+                    print(f"[{format_time(now_iso())}] {snapshot['event']}", flush=True)
+            else:
+                clear_screen()
+                print(render_snapshot(snapshot))
+            if args.once:
+                break
+            time.sleep(max(1, poll_interval))
+    except KeyboardInterrupt:
+        if not args.quiet:
+            print("\n已停止前台调度。")
+    return 0
+
+
+def cmd_daemon_start(_: argparse.Namespace) -> int:
+    ensure_layout()
+    config = load_config()
+    session = config["daemon_session_name"]
+    if screen_exists(session):
+        print(f"守护进程已在运行: {session}")
+        return 0
+    log_path = daemon_log_path()
+    cmd = (
+        f"cd {shlex.quote(str(BASE_DIR))} && "
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(BASE_DIR / 'gpuq'))} run --quiet "
+        f">> {shlex.quote(str(log_path))} 2>&1"
+    )
+    proc = run_command(["screen", "-dmS", session, "/bin/bash", "-lc", cmd], check=False)
+    if proc.returncode != 0:
+        raise CliError(f"守护进程启动失败: {proc.stderr.strip()}")
+    time.sleep(1)
+    if not screen_exists(session):
+        raise CliError("守护进程 screen 会话没有成功启动。")
+    print(f"守护进程已启动: {session}")
+    print(f"log: {log_path}")
+    return 0
+
+
+def cmd_daemon_stop(_: argparse.Namespace) -> int:
+    ensure_layout()
+    config = load_config()
+    session = config["daemon_session_name"]
+    if not screen_exists(session):
+        print("守护进程未运行。")
+        return 0
+    run_command(["screen", "-S", session, "-X", "quit"], check=False)
+    time.sleep(1)
+    print(f"守护进程已停止: {session}")
+    return 0
+
+
+def cmd_daemon_status(_: argparse.Namespace) -> int:
+    ensure_layout()
+    config = load_config()
+    session = config["daemon_session_name"]
+    print(f"session: {session}")
+    print(f"status: {'running' if screen_exists(session) else 'stopped'}")
+    print(f"log: {daemon_log_path()}")
+    return 0
+
+
+def cmd_daemon_logs(args: argparse.Namespace) -> int:
+    path = daemon_log_path()
+    if not path.exists():
+        print(f"log file not found: {path}")
+        return 0
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    for line in lines[-args.lines :]:
+        print(line.rstrip("\n"))
+    return 0
+
+
+def coerce_config_value(key: str, value: str) -> Any:
+    if key not in DEFAULT_CONFIG:
+        raise CliError(f"不支持的配置项: {key}")
+    template = DEFAULT_CONFIG[key]
+    if isinstance(template, bool):
+        return parse_bool(value)
+    if isinstance(template, int):
+        return int(value)
+    return value
+
+
+def cmd_config_show(_: argparse.Namespace) -> int:
+    ensure_layout()
+    config = load_config()
+    print(json.dumps(config, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_config_set(args: argparse.Namespace) -> int:
+    ensure_layout()
+    with state_lock():
+        config = load_config()
+        config[args.key] = coerce_config_value(args.key, args.value)
+        save_config(config)
+    print(f"配置已更新: {args.key}={config[args.key]}")
+    return 0
+
+
+def cmd_config_reset(_: argparse.Namespace) -> int:
+    ensure_layout()
+    with state_lock():
+        save_config(DEFAULT_CONFIG.copy())
+    print("配置已重置为默认值。")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gpuq",
+        description="GPU 排队调度器：等待指定 GPU 空闲后，在 screen 中按队列顺序运行任务。",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    init_p = sub.add_parser("init", help="初始化运行目录")
+    init_p.set_defaults(func=cmd_init)
+
+    doctor_p = sub.add_parser("doctor", help="检查依赖和目录")
+    doctor_p.set_defaults(func=cmd_doctor)
+
+    add_p = sub.add_parser("add", help="添加一个排队任务")
+    add_p.add_argument("--name", help="任务名")
+    add_p.add_argument("--cwd", help="运行目录")
+    add_p.add_argument("--command", help="执行命令，通常是 sh 脚本")
+    add_p.add_argument("--gpus", help="GPU 列表，如 0,1,2；留空或 all 表示全部")
+    add_p.add_argument("--queue", help="目标队列名")
+    add_p.add_argument("--priority", type=int, help="优先级，数字越大越优先")
+    add_p.add_argument("--schedule-at", help="定时启动: +2h, +30m, 2026-05-01 08:00")
+    add_p.add_argument("--conda-env", help="Conda 环境名（自动 source conda.sh 并 activate）")
+    add_p.add_argument("--launch-hold-s", type=int, help="任务启动后的保护时间")
+    add_p.add_argument("--idle-util-threshold", type=int, help="判定空闲的 util 阈值")
+    add_p.add_argument("--idle-mem-threshold-mb", type=int, help="判定空闲的显存阈值")
+    add_p.add_argument("--idle-streak-required", type=int, help="连续空闲多少轮后启动")
+    add_p.add_argument(
+        "--set-cuda-visible-devices",
+        type=parse_bool,
+        help="是否自动注入 CUDA_VISIBLE_DEVICES=true/false",
+    )
+    add_p.set_defaults(func=cmd_add)
+
+    list_p = sub.add_parser("list", help="查看队列")
+    list_p.add_argument("--all", action="store_true", help="包含已完成和失败的历史任务")
+    list_p.add_argument("--queue", help="只显示指定队列")
+    list_p.set_defaults(func=cmd_list)
+
+    queues_p = sub.add_parser("queues", help="查看所有队列概览")
+    queues_p.set_defaults(func=cmd_queues)
+
+    prio_p = sub.add_parser("prioritize", help="修改任务优先级")
+    prio_p.add_argument("job_id", type=int)
+    prio_p.add_argument("priority", type=int)
+    prio_p.set_defaults(func=cmd_prioritize)
+
+    show_p = sub.add_parser("show", help="查看单个任务详情")
+    show_p.add_argument("job_id", type=int)
+    show_p.set_defaults(func=cmd_show)
+
+    status_p = sub.add_parser("status", help="查看 GPU 和队列状态")
+    status_p.add_argument("--all", action="store_true", help="展示完整历史")
+    status_p.set_defaults(func=cmd_status)
+
+    remove_p = sub.add_parser("remove", help="删除非运行中的任务")
+    remove_p.add_argument("job_id", type=int)
+    remove_p.set_defaults(func=cmd_remove)
+
+    cancel_p = sub.add_parser("cancel", help="取消任务")
+    cancel_p.add_argument("job_id", type=int)
+    cancel_p.add_argument("--force", action="store_true", help="强制停止运行中的 screen 会话")
+    cancel_p.set_defaults(func=cmd_cancel)
+
+    retry_p = sub.add_parser("retry", help="把已结束任务重新排回队列")
+    retry_p.add_argument("job_id", type=int)
+    retry_p.set_defaults(func=cmd_retry)
+
+    logs_p = sub.add_parser("logs", help="查看任务日志尾部")
+    logs_p.add_argument("job_id", type=int)
+    logs_p.add_argument("--lines", type=int, default=50)
+    logs_p.set_defaults(func=cmd_logs)
+
+    run_p = sub.add_parser("run", help="前台运行调度器")
+    run_p.add_argument("--once", action="store_true", help="只跑一轮检测")
+    run_p.add_argument("--quiet", action="store_true", help="不打印 dashboard")
+    run_p.add_argument("--queue", help="只处理指定队列")
+    run_p.add_argument("--poll-interval", type=int, help="覆盖轮询间隔")
+    run_p.set_defaults(func=cmd_run)
+
+    daemon_p = sub.add_parser("daemon", help="后台守护进程管理")
+    daemon_sub = daemon_p.add_subparsers(dest="daemon_cmd", required=True)
+
+    daemon_start_p = daemon_sub.add_parser("start", help="启动后台守护进程")
+    daemon_start_p.set_defaults(func=cmd_daemon_start)
+
+    daemon_stop_p = daemon_sub.add_parser("stop", help="停止后台守护进程")
+    daemon_stop_p.set_defaults(func=cmd_daemon_stop)
+
+    daemon_status_p = daemon_sub.add_parser("status", help="查看后台守护进程状态")
+    daemon_status_p.set_defaults(func=cmd_daemon_status)
+
+    daemon_logs_p = daemon_sub.add_parser("logs", help="查看后台守护进程日志")
+    daemon_logs_p.add_argument("--lines", type=int, default=80)
+    daemon_logs_p.set_defaults(func=cmd_daemon_logs)
+
+    config_p = sub.add_parser("config", help="查看或修改默认配置")
+    config_sub = config_p.add_subparsers(dest="config_cmd", required=True)
+
+    config_show_p = config_sub.add_parser("show", help="展示配置")
+    config_show_p.set_defaults(func=cmd_config_show)
+
+    config_set_p = config_sub.add_parser("set", help="设置单个配置项")
+    config_set_p.add_argument("key")
+    config_set_p.add_argument("value")
+    config_set_p.set_defaults(func=cmd_config_set)
+
+    config_reset_p = config_sub.add_parser("reset", help="恢复默认配置")
+    config_reset_p.set_defaults(func=cmd_config_reset)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        require_binary("screen")
+    except CliError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    if args.command is None:
+        try:
+            Dashboard().run()
+        except CliError as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            print()
+        return 0
+    try:
+        return int(args.func(args))
+    except CliError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as exc:
+        message = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+        print(f"命令执行失败: {message}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

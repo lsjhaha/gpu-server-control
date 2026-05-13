@@ -36,6 +36,7 @@ if %ERRORLEVEL% NEQ 0 (
     --onefile ^
     --windowed ^
     --name GPU_Server_Control ^
+    --add-data "%~dp0queue_runner\gpuq;queue_runner" ^
     --hidden-import bcrypt ^
     --hidden-import nacl ^
     --hidden-import cryptography ^

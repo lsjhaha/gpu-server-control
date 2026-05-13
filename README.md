@@ -1,5 +1,7 @@
 # GPU Server Control
 
+[中文](README.zh-CN.md)
+
 A small Windows desktop tool for managing remote NVIDIA GPU servers over SSH.
 
 It focuses on two daily pain points in research labs and small GPU clusters:
@@ -35,12 +37,24 @@ The app is written in Python/Tkinter and can also be packaged as a portable Wind
   - Empty password means key-based login.
   - Non-empty password means password login.
 
+- **GPU Queue Runner integration**
+  - Bundles the `gpuq` queue runner script.
+  - Installs or syncs `gpuq` to a selected remote server from the GUI.
+  - Adds queued training jobs with working directory, command, GPUs, priority, queue name, and conda environment.
+  - Starts, stops, and checks the remote daemon.
+  - Shows queue status, job details, and logs.
+
+- **English / Chinese UI**
+  - The default interface language is English.
+  - Switch to Chinese from `Settings`.
+
 ## Screenshots
 
-Screenshots are not included in this repository yet. The main window has two tabs:
+Screenshots are not included in this repository yet. The main window has three tabs:
 
 - `GPU Monitor`
 - `Conda Migration`
+- `Queue Runner`
 
 ## Requirements
 
@@ -60,9 +74,11 @@ For remote Linux servers:
 
 - `bash`
 - `tar`
+- `base64`
 - NVIDIA driver and `nvidia-smi` for GPU monitoring
 - A working conda/miniconda installation for environment migration
 - Network access from the source server to install `conda-pack` if it is not already installed
+- `screen` if you use Queue Runner daemon jobs
 
 ## Quick Start
 
@@ -191,6 +207,32 @@ Target shared dir: /mnt/share-b/user
 ```
 
 In this case, fill both fields. The app rewrites the archive path before unpacking on the target.
+
+## Queue Runner Workflow
+
+The `Queue Runner` tab wraps the bundled `queue_runner/gpuq` command-line scheduler.
+
+Typical use:
+
+```text
+1. Select a server.
+2. Set a remote gpuq directory, for example /mnt/share/user/gpu-queue-runner.
+3. Click Install/Sync. The app uploads gpuq, makes it executable, runs init, and runs doctor.
+4. Add jobs from the GUI.
+5. Start the daemon.
+6. Refresh status or view logs.
+```
+
+Each queued job can specify:
+
+- Working directory
+- Command
+- GPUs, for example `0,1,2,3` or `all`
+- Queue name
+- Priority
+- Conda environment
+
+`gpuq` starts jobs inside remote `screen` sessions and injects `CUDA_VISIBLE_DEVICES` by default.
 
 ## Important Notes
 
