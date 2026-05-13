@@ -65,6 +65,9 @@ TEXTS = {
         "conda_root": "miniconda root",
         "env_name": "Environment name",
         "target_env_name": "Target env name",
+        "source_env_placeholder": "<source env>",
+        "source_server_placeholder": "<source server>",
+        "target_server_placeholder": "<target server>",
         "shared_dir": "Source shared",
         "target_shared": "Target shared",
         "target_shared_hint": "Blank = same as source",
@@ -135,6 +138,9 @@ TEXTS = {
         "conda_root": "miniconda 根目录",
         "env_name": "环境名",
         "target_env_name": "目标环境名",
+        "source_env_placeholder": "<源环境名>",
+        "source_server_placeholder": "<源服务器>",
+        "target_server_placeholder": "<目标服务器>",
         "shared_dir": "源共享目录",
         "target_shared": "目标共享目录",
         "target_shared_hint": "留空表示与源一致",
@@ -1003,10 +1009,11 @@ class App(tk.Tk):
         self.main_frame.pack(fill="both", expand=True)
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x", padx=18, pady=(16, 8))
-        ttk.Label(header, text="GPU Server Control", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text=self.tr("subtitle"), style="Muted.TLabel").pack(side="left", padx=(16, 0), pady=(9, 0))
-        ttk.Button(header, text=self.tr("settings"), command=self.open_app_settings).pack(side="right", pady=(4, 0), padx=(8, 0))
-        ttk.Button(header, text=self.tr("servers"), command=self.open_server_settings).pack(side="right", pady=(4, 0))
+        header.grid_columnconfigure(1, weight=1)
+        ttk.Label(header, text="GPU Server Control", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=self.tr("subtitle"), style="Muted.TLabel").grid(row=0, column=1, sticky="w", padx=(16, 12), pady=(9, 0))
+        ttk.Button(header, text=self.tr("servers"), command=self.open_server_settings).grid(row=0, column=2, sticky="e", pady=(4, 0), padx=(0, 8))
+        ttk.Button(header, text=self.tr("settings"), command=self.open_app_settings).grid(row=0, column=3, sticky="e", pady=(4, 0))
 
         notebook = ttk.Notebook(self.main_frame)
         notebook.pack(fill="both", expand=True, padx=18, pady=(0, 18))
@@ -1261,10 +1268,10 @@ class App(tk.Tk):
             var.trace_add("write", lambda *_: self._update_preview())
 
     def _update_preview(self) -> None:
-        env = self.env_name_var.get().strip() or "<源环境名>"
+        env = self.env_name_var.get().strip() or self.tr("source_env_placeholder")
         target_env = self.target_env_name_var.get().strip() or env
-        src = self.source_server_var.get() or "<源服务器>"
-        dst = self.target_server_var.get() or "<目标服务器>"
+        src = self.source_server_var.get() or self.tr("source_server_placeholder")
+        dst = self.target_server_var.get() or self.tr("target_server_placeholder")
         shared = self.shared_dir_var.get().strip() or DEFAULT_SHARED_DIR
         target_shared = self.target_shared_dir_var.get().strip() or shared
         self.preview_var.set(
