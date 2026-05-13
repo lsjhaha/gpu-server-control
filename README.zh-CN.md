@@ -2,51 +2,53 @@
 
 [English](README.md)
 
-一个在 Windows 本机运行的远程 NVIDIA GPU 服务器管理工具。它通过 SSH 连接 Linux 服务器，提供 GPU 状态监控、conda 环境迁移和 GPU 任务排队管理。
+GPU Server Control 是一个运行在 Windows 本机上的开源桌面工具，用来通过 SSH 管理多台 Linux GPU 服务器。
 
-## 功能
+它主要解决实验室、学生团队和小型 GPU 集群里最常见的几类重复劳动：
 
-- **紧凑 GPU 看板**
-  - 通过 SSH 调用多台服务器的 `nvidia-smi`。
-  - 每台服务器一行，每张 GPU 用进度条展示。
-  - 在进度条内显示利用率和显存占用。
-  - 可配置空闲判断阈值。
+- 一眼看清哪些服务器还有空闲 GPU
+- 在不同服务器之间迁移 conda 环境，减少重复手工打包和解压
+- 用轻量队列工具把任务分发到远端 GPU 机器
 
-- **持久 SSH 监控**
-  - GPU 刷新复用 Paramiko SSH 连接，不需要每次刷新都重连。
-  - 支持密钥登录和可选密码登录。
-  - 支持自定义 SSH 端口。
+## 示例截图
 
-- **Conda 环境迁移**
-  - 在源服务器使用 `conda-pack` 打包环境。
-  - 如果源 conda base 中缺少 `conda-pack`，会自动尝试安装。
-  - 压缩包写入共享目录，例如 `/mnt/share/user/conda-packs`。
-  - 在目标服务器解压到 `<目标 conda 根目录>/envs/<环境名>`。
-  - 解压后自动运行 `conda-unpack`。
-  - 支持源服务器和目标服务器共享盘挂载路径不同的情况。
+![GPU 监控](assets/cn1.png)
 
-- **任务队列集成**
-  - 内置 `queue_runner/gpuq` 脚本。
-  - 可以从 GUI 一键同步/安装到远端服务器。
-  - 支持添加排队任务：运行目录、命令、GPU、队列、优先级、conda 环境。
-  - 支持启动/停止远端 daemon。
-  - 支持查看队列状态、任务详情和日志。
+![Conda 环境迁移](assets/cn2.png)
 
-- **服务器管理界面**
-  - 可以在界面中新增、修改、删除服务器。
-  - 密码留空表示使用 SSH 密钥。
-  - 填写密码则使用密码登录。
+![任务队列](assets/cn3.png)
 
-- **中英文界面**
-  - 默认英文界面。
-  - 可在 `Settings` 中切换中文。
+## 功能特性
+
+- 面向多台 Linux 服务器的紧凑型 GPU 看板
+- 通过 SSH 调用 `nvidia-smi` 进行 GPU 监控
+- 每张 GPU 使用进度条展示利用率和显存占用
+- 复用 SSH 连接，减少重复刷新时的重连开销
+- 支持 conda 环境打包、迁移、解压和 `conda-unpack`
+- 源服务器缺少 `conda-pack` 时自动尝试安装
+- 内置 `gpuq`，支持远端任务排队
+- 可视化管理服务器的 host、user、port 和密码登录
+- 支持中英文界面
+- 支持打包为便携版 Windows `.exe`
+
+## 这个项目想解决什么问题
+
+很多 GPU 工作流真正麻烦的并不是训练本身，而是训练前后的那堆重复操作：
+
+- 一台一台登录服务器
+- 反复执行 `nvidia-smi`
+- 猜哪台机器是真正空闲的
+- 手工重复 `conda-pack`
+- 在多个终端之间复制命令
+
+GPU Server Control 的目标，就是把这些日常运维动作收进一个桌面工具里。
 
 ## 运行要求
 
-Windows 本机运行源码需要：
+在 Windows 上运行源码需要：
 
 - Python 3.10+
-- Tkinter，通常 Windows Python 或 Miniconda 自带
+- Tkinter
 - `paramiko`
 
 安装依赖：
@@ -61,12 +63,12 @@ pip install -r requirements.txt
 - `tar`
 - `base64`
 - NVIDIA 驱动和 `nvidia-smi`
-- 用于环境迁移的 conda/miniconda
+- 可用的 conda/miniconda 安装
 - 如果使用任务队列 daemon，需要 `screen`
 
 ## 快速开始
 
-复制示例配置：
+先创建服务器配置：
 
 ```powershell
 copy servers.example.json servers.json
@@ -79,39 +81,31 @@ notepad servers.json
 python gpu_server_tool.py
 ```
 
-或双击/运行：
+或者使用启动脚本：
 
 ```powershell
 run_gpu_server_tool.bat
 ```
 
-## 便携版 exe
+## 便携版 EXE
 
-构建独立 exe：
+构建独立可执行文件：
 
 ```powershell
 build_exe.bat
 ```
 
-生成文件：
+输出路径：
 
 ```text
 dist/GPU_Server_Control.exe
 ```
 
-运行时请把 `servers.json` 放在 exe 同目录：
-
-```text
-dist/
-  GPU_Server_Control.exe
-  servers.json
-```
-
-打包后的 exe 内置 Python 和依赖，新 Windows 机器不需要安装 Python。
+运行时请把 `servers.json` 放在 exe 同目录。
 
 ## 服务器配置
 
-`servers.json` 示例：
+`servers.json` 是一个服务器数组，例如：
 
 ```json
 [
@@ -137,13 +131,13 @@ dist/
 
 字段说明：
 
-- `alias`：显示名，必须唯一。
-- `hostname`：IP 或域名。
-- `user`：SSH 用户名。
-- `port`：可选 SSH 端口，默认 `22`。
-- `password`：可选。为空或省略时使用密钥登录。
+- `alias`：唯一显示名
+- `hostname`：IP 或域名
+- `user`：SSH 用户名
+- `port`：可选，默认 `22`
+- `password`：可选，留空表示使用密钥登录
 
-默认密钥路径：
+默认 SSH 密钥路径：
 
 ```text
 %USERPROFILE%\.ssh\id_ed25519
@@ -151,102 +145,75 @@ dist/
 
 ## Conda 环境迁移
 
-在 `Conda Migration` 页面选择：
-
-- 源服务器
-- 源 miniconda 根目录
-- 环境名
-- 目标服务器
-- 目标 miniconda 根目录
-- 目标环境名
-- 源共享目录
-- 可选目标共享目录
-
-流程：
+程序执行流程如下：
 
 ```text
-1. SSH 到源服务器。
-2. 检查 <源 conda 根目录>/envs/<环境名>。
-3. 确保源 base 环境中有 conda-pack。
-4. 打包到 <源共享目录>/conda-packs/*.tar.gz。
-5. SSH 到目标服务器。
-6. 如果共享盘挂载路径不同，自动重写压缩包路径。
-7. 解压到 <目标 conda 根目录>/envs/<目标环境名>。
-8. 运行 conda-unpack。
+1. SSH 到源服务器
+2. 检查源环境目录
+3. 确保 conda-pack 可用
+4. 把环境打包到共享目录
+5. SSH 到目标服务器
+6. 如有需要，处理源/目标共享路径不同的问题
+7. 解压到目标 conda 的 envs 目录
+8. 执行 conda-unpack
 ```
 
-如果同一共享盘在不同服务器路径不同，例如：
+如果同一块共享存储在不同服务器上的挂载路径不同，这个工具也支持分别填写源路径和目标路径。
 
-```text
-源共享目录: /mnt/share-a/user
-目标共享目录: /mnt/share-b/user
-```
+## 任务队列
 
-请同时填写两个路径。
-
-## Queue Runner
-
-`Queue Runner` 页面封装了内置的 `gpuq` 调度器。
+`Queue Runner` 页面封装了内置的 `queue_runner/gpuq` 调度脚本。
 
 典型流程：
 
 ```text
-1. 选择服务器。
-2. 设置远端 gpuq 目录，例如 /mnt/share/user/gpu-queue-runner。
-3. 点击 Install/Sync，同步 gpuq 并执行 init/doctor。
-4. 从 GUI 添加任务。
-5. 启动 daemon。
-6. 刷新状态或查看日志。
+1. 选择服务器
+2. 设置一个远端可写的 gpuq 目录
+3. 点击 Install/Sync
+4. 在界面中添加任务
+5. 启动 daemon
+6. 刷新状态或查看日志
 ```
 
-任务支持：
+注意：
 
-- 运行目录
-- 命令
-- GPU，例如 `0,1,2,3` 或 `all`
-- 队列名
-- 优先级
-- Conda 环境
-
-`gpuq` 会在远端 `screen` 会话中启动任务，默认注入 `CUDA_VISIBLE_DEVICES`。
-
-## 注意事项
-
-- 不要提交真实 `servers.json`，其中可能包含内网 IP、用户名、密码或临时云主机地址。
-- 建议优先使用 SSH 密钥，避免在配置文件里保存密码。
-- 大型 conda 环境打包和解压可能耗时较久。
-- `conda-pack` 对严重不一致的环境仍可能失败；本工具已使用 `--ignore-missing-files` 和 `--ignore-editable-packages` 尽量兼容科研环境。
-- 目标 conda 根目录需要已经存在；本工具负责迁移环境，不负责安装 Miniconda。
+- 远端 `gpuq` 目录必须对当前登录用户可写
+- 有些共享目录虽然能读，但不能写入运行时状态文件
+- 这种情况下，建议改成用户自己的目录，例如 `/home/<user>/.gpuq-runner`
 
 ## 常见问题
 
 ### `servers.json format error`
 
-JSON 最后一项后面不能有逗号。建议用界面里的 `Manage Servers` 管理服务器，避免手写错误。
+JSON 最后一项后面不能多写逗号。
 
 ### `Cannot find conda executable`
 
-请填写 conda 根目录，而不是 `bin` 目录：
+请填写 conda 根目录，而不是 `bin` 目录。
+
+例如：
 
 ```text
 /data/user/miniconda3
 ```
 
-程序会寻找：
-
-```text
-/data/user/miniconda3/bin/conda
-```
-
 ### `Archive is not visible on target server`
 
-目标服务器看不到源服务器生成的压缩包。常见原因：
+常见原因有：
 
-- 源和目标不是同一个共享存储。
-- 同一个共享存储在目标服务器路径不同。
-- 目标用户没有读取权限。
+- 源服务器和目标服务器并不共享同一块存储
+- 两台服务器上的挂载路径不同
+- 目标用户没有权限读取压缩包
 
-路径不同请填写 `Target shared`。
+### Queue Runner 出现权限错误
+
+说明配置的远端 `gpuq` 目录对当前用户不可写。
+
+建议改用：
+
+```text
+/home/<user>/.gpuq-runner
+```
 
 ## 开发
 
@@ -264,4 +231,4 @@ build_exe.bat
 
 ## License
 
-尚未选择开源许可证。发布前建议添加 LICENSE。
+当前仓库还没有添加开源许可证。如果准备公开发布，建议补上 LICENSE。

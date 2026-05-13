@@ -2,66 +2,53 @@
 
 [中文](README.zh-CN.md)
 
-A small Windows desktop tool for managing remote NVIDIA GPU servers over SSH.
+GPU Server Control is an open-source Windows desktop tool for managing multiple Linux GPU servers over SSH.
 
-It focuses on two daily pain points in research labs and small GPU clusters:
+It is built for the everyday workflow of research labs, student teams, and small GPU clusters:
 
-- Quickly seeing which machines have idle GPUs.
-- Moving large conda environments from one server to another without repeating manual packaging, copying, unpacking, and path-fixing steps.
-
-The app is written in Python/Tkinter and can also be packaged as a portable Windows `.exe`.
-
-## Features
-
-- **Compact GPU dashboard**
-  - Polls `nvidia-smi` on multiple Linux servers over SSH.
-  - Shows one row per server and one progress bar per GPU.
-  - Displays utilization and memory usage inside each GPU bar.
-  - Highlights idle GPUs based on configurable utilization and memory thresholds.
-
-- **Persistent SSH monitoring**
-  - Reuses Paramiko SSH sessions for refreshes instead of reconnecting every time.
-  - Supports SSH key login and optional password login.
-  - Supports custom SSH ports.
-
-- **Conda environment migration**
-  - Packs a source environment with `conda-pack`.
-  - Automatically installs `conda-pack` into the source conda base when missing.
-  - Writes archives to a shared directory such as `/mnt/share/user/conda-packs`.
-  - Unpacks on the target server into `<target conda root>/envs/<env name>`.
-  - Runs `conda-unpack` after extraction.
-  - Supports different source and target shared mount paths for the same storage.
-
-- **Manage servers from the UI**
-  - Add, update, and delete servers without editing JSON by hand.
-  - Empty password means key-based login.
-  - Non-empty password means password login.
-
-- **GPU Queue Runner integration**
-  - Bundles the `gpuq` queue runner script.
-  - Installs or syncs `gpuq` to a selected remote server from the GUI.
-  - Adds queued training jobs with working directory, command, GPUs, priority, queue name, and conda environment.
-  - Starts, stops, and checks the remote daemon.
-  - Shows queue status, job details, and logs.
-
-- **English / Chinese UI**
-  - The default interface language is English.
-  - Switch to Chinese from `Settings`.
+- See which servers still have free GPUs at a glance
+- Move conda environments between servers without repeating manual `conda-pack` steps
+- Send jobs to remote GPU machines with a lightweight queue runner
 
 ## Screenshots
 
-Screenshots are not included in this repository yet. The main window has three tabs:
+![GPU Monitor](assets/en1.png)
 
-- `GPU Monitor`
-- `Conda Migration`
-- `Queue Runner`
+![Conda Migration](assets/en2.png)
+
+![Queue Runner](assets/en3.png)
+
+## Features
+
+- Compact GPU dashboard for multiple Linux servers
+- SSH-based GPU polling with `nvidia-smi`
+- Free/Busy GPU view with per-GPU progress bars
+- Persistent SSH session reuse for smoother refreshes
+- Conda environment packing, transfer, unpacking, and `conda-unpack`
+- Automatic `conda-pack` installation when missing on the source server
+- Built-in remote queue runner integration with bundled `gpuq`
+- GUI-based server management with host, user, port, and optional password
+- English and Chinese interface
+- Portable Windows `.exe` packaging
+
+## Why This Project Exists
+
+In many real GPU workflows, the annoying part is not training itself. It is the surrounding operational work:
+
+- logging into several servers one by one
+- checking `nvidia-smi` again and again
+- guessing which machine is actually usable
+- repacking the same conda environment manually
+- copying commands between terminals
+
+GPU Server Control turns those repeated shell tasks into a single desktop tool.
 
 ## Requirements
 
 For running from source on Windows:
 
 - Python 3.10+
-- Tkinter, usually bundled with Python or Miniconda on Windows
+- Tkinter
 - `paramiko`
 
 Install dependencies:
@@ -75,14 +62,13 @@ For remote Linux servers:
 - `bash`
 - `tar`
 - `base64`
-- NVIDIA driver and `nvidia-smi` for GPU monitoring
-- A working conda/miniconda installation for environment migration
-- Network access from the source server to install `conda-pack` if it is not already installed
+- NVIDIA driver and `nvidia-smi`
+- a working conda/miniconda installation for migration
 - `screen` if you use Queue Runner daemon jobs
 
 ## Quick Start
 
-Clone the project and create your server config:
+Create your server config:
 
 ```powershell
 copy servers.example.json servers.json
@@ -101,8 +87,6 @@ Or use the launcher:
 run_gpu_server_tool.bat
 ```
 
-The launcher tries to find a usable Python, verifies Tkinter and pip, installs dependencies from `requirements.txt`, and then starts the app. A `startup.log` file is written for troubleshooting.
-
 ## Portable Windows Build
 
 Build a standalone executable:
@@ -111,21 +95,13 @@ Build a standalone executable:
 build_exe.bat
 ```
 
-The generated app is placed under:
+Output:
 
 ```text
 dist/GPU_Server_Control.exe
 ```
 
-Keep `servers.json` next to the executable:
-
-```text
-dist/
-  GPU_Server_Control.exe
-  servers.json
-```
-
-The packaged `.exe` includes Python and Python dependencies, so the target Windows machine does not need Python installed.
+Keep `servers.json` next to the executable.
 
 ## Server Configuration
 
@@ -155,144 +131,93 @@ The packaged `.exe` includes Python and Python dependencies, so the target Windo
 
 Fields:
 
-- `alias`: Short display name. Must be unique.
-- `hostname`: IP address or domain name.
-- `user`: SSH username.
-- `port`: Optional SSH port. Defaults to `22`.
-- `password`: Optional. If omitted or empty, the app uses key-based login.
+- `alias`: unique display name
+- `hostname`: IP or domain
+- `user`: SSH username
+- `port`: optional, default `22`
+- `password`: optional, blank means key-based login
 
-For key login, the default key path is:
+Default SSH key path:
 
 ```text
 %USERPROFILE%\.ssh\id_ed25519
 ```
 
-If that key is missing, Paramiko falls back to the SSH agent or default key lookup.
+## Conda Migration
 
-## Conda Migration Workflow
-
-In the `Conda Migration` tab, choose:
-
-- Source server
-- Source miniconda root
-- Environment name
-- Target server
-- Target miniconda root
-- Target environment name
-- Source shared directory
-- Optional target shared directory
-
-The app performs:
+The app performs the following flow:
 
 ```text
-1. SSH to source server.
-2. Check <source conda root>/envs/<env>.
-3. Ensure conda-pack is installed in source base.
-4. Pack the env to <source shared dir>/conda-packs/*.tar.gz.
-5. SSH to target server.
-6. Map the archive path when source and target shared mount paths differ.
-7. Extract to <target conda root>/envs/<target env>.
-8. Run conda-unpack.
+1. SSH to the source server
+2. Check the source env directory
+3. Ensure conda-pack is available
+4. Pack the env to a shared directory
+5. SSH to the target server
+6. Resolve shared-path differences if needed
+7. Unpack into the target conda envs directory
+8. Run conda-unpack
 ```
 
-### Different Shared Mount Paths
+It supports cases where the same shared storage is mounted under different paths on different servers.
 
-Sometimes the same storage is mounted under different paths on different servers.
+## Queue Runner
 
-Example:
+The `Queue Runner` tab wraps the bundled `queue_runner/gpuq` scheduler.
+
+Typical workflow:
 
 ```text
-Source shared dir: /mnt/share-a/user
-Target shared dir: /mnt/share-b/user
+1. Select a server
+2. Choose a writable remote gpuq directory
+3. Click Install/Sync
+4. Add jobs from the GUI
+5. Start the daemon
+6. Refresh status or inspect logs
 ```
 
-In this case, fill both fields. The app rewrites the archive path before unpacking on the target.
+Important note:
 
-## Queue Runner Workflow
-
-The `Queue Runner` tab wraps the bundled `queue_runner/gpuq` command-line scheduler.
-
-Typical use:
-
-```text
-1. Select a server.
-2. Set a remote gpuq directory, for example /mnt/share/user/gpu-queue-runner.
-3. Click Install/Sync. The app uploads gpuq, makes it executable, runs init, and runs doctor.
-4. Add jobs from the GUI.
-5. Start the daemon.
-6. Refresh status or view logs.
-```
-
-Each queued job can specify:
-
-- Working directory
-- Command
-- GPUs, for example `0,1,2,3` or `all`
-- Queue name
-- Priority
-- Conda environment
-
-`gpuq` starts jobs inside remote `screen` sessions and injects `CUDA_VISIBLE_DEVICES` by default.
-
-## Important Notes
-
-- Do not commit your real `servers.json` if it contains private IPs, usernames, passwords, or temporary cloud SSH hosts.
-- Prefer SSH keys over storing passwords in `servers.json`.
-- Very large conda environments may take a long time to pack or unpack.
-- `conda-pack` may fail on severely inconsistent environments. The app uses `--ignore-missing-files` and `--ignore-editable-packages` to tolerate common research-environment issues, but a broken env may still need manual cleanup.
-- The target conda root must already exist. This tool migrates environments; it does not install Miniconda on the target server.
+- the remote `gpuq` directory must be writable by the remote user
+- on some servers, shared mount paths may be readable but not writable
+- if that happens, use a per-user path such as `/home/<user>/.gpuq-runner`
 
 ## Troubleshooting
 
 ### `servers.json format error`
 
-JSON does not allow a trailing comma after the last item:
-
-```json
-[
-  {"alias": "gpu-01", "hostname": "192.168.1.101", "user": "me"}
-]
-```
-
-Use the `Manage Servers` button in the app to avoid hand-editing mistakes.
+Do not leave a trailing comma after the last item in JSON.
 
 ### `Cannot find conda executable`
 
-Check the miniconda root path. It should be the root directory, not the `bin` directory:
+Use the conda root directory, not the `bin` directory.
+
+Example:
 
 ```text
 /data/user/miniconda3
 ```
 
-The app expects:
-
-```text
-/data/user/miniconda3/bin/conda
-```
-
 ### `Archive is not visible on target server`
 
-The target server cannot see the archive path produced on the source server. Common causes:
+Common causes:
 
-- Source and target do not share the same storage.
-- The same storage is mounted at a different path on the target.
-- Permissions prevent the target user from reading the archive.
+- source and target do not actually share the same storage
+- the mount path differs across servers
+- the target user cannot read the archive
 
-Use the `Target shared` field when mount paths differ.
+### Queue Runner fails with permission errors
 
-### GPU monitor says connection failed
+The configured remote `gpuq` directory is not writable by the remote user.
 
-Check:
+Use a writable path such as:
 
-- Hostname/IP and SSH port.
-- Username.
-- Whether the Windows machine can reach the server.
-- Whether key or password login is configured correctly.
-- Whether `nvidia-smi` exists on the remote server.
+```text
+/home/<user>/.gpuq-runner
+```
 
 ## Development
 
-Run syntax check:
+Syntax check:
 
 ```powershell
 python -m py_compile gpu_server_tool.py
