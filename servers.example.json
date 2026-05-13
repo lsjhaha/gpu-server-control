@@ -1,0 +1,19 @@
+[
+  {
+    "alias": "gpu-01",
+    "hostname": "192.168.1.101",
+    "user": "your_user"
+  },
+  {
+    "alias": "gpu-02-custom-port",
+    "hostname": "example.host.name",
+    "user": "root",
+    "port": 32761
+  },
+  {
+    "alias": "gpu-03-password-login",
+    "hostname": "192.168.1.103",
+    "user": "your_user",
+    "password": "optional_password"
+  }
+]
